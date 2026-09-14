@@ -11,6 +11,7 @@ mod llm;
 mod logging;
 mod ratelimit;
 mod scrub;
+mod spaces;
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
@@ -366,7 +367,7 @@ fn cmd_once(paths: &Paths, force: bool) -> i32 {
     let provider = select_provider(&config);
     let mut d = Daemon::new(paths.clone(), config, provider);
     match d.pass(force) {
-        Ok((stats, outcomes)) => {
+        Ok((stats, outcomes, spaces)) => {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
@@ -374,6 +375,7 @@ fn cmd_once(paths: &Paths, force: bool) -> i32 {
                     "provider": d.provider.as_ref().map(|p| p.to_string()),
                     "stats": stats,
                     "panes": outcomes,
+                    "spaces": spaces,
                 }))
                 .unwrap_or_default()
             );

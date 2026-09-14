@@ -30,3 +30,10 @@ llm_global_per_min = 6
 # If `allow` is non-empty, only matching panes are labeled. `deny` always wins.
 allow = []
 deny = []
+
+# What gets labelled. Panes get a display-only title (shown in pane borders); spaces — the
+# workspace rows in the sidebar — are renamed after the activity of their panes (herdr has no
+# display-only title for workspaces). Names you typed yourself are never touched, and our space
+# names are put back when the daemon stops.
+label_panes = true
+label_spaces = true

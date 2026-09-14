@@ -12,12 +12,17 @@ use serde_json::{Value, json};
 
 pub const SOURCE: &str = "plugin:autolabel";
 const TIMEOUT: Duration = Duration::from_secs(5);
+const RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub enum Error {
     /// Could not connect to the socket (server gone).
     Connect(std::io::Error),
-    Io(std::io::Error),
+    /// A socket syscall failed; `step` names the failing operation (connect/write/read/…).
+    Io {
+        step: &'static str,
+        err: std::io::Error,
+    },
     Json(serde_json::Error),
     /// Server-side error response.
     Api {
@@ -31,7 +36,7 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Error::Connect(e) => write!(f, "connect: {e}"),
-            Error::Io(e) => write!(f, "io: {e}"),
+            Error::Io { step, err } => write!(f, "io {step}: {err}"),
             Error::Json(e) => write!(f, "json: {e}"),
             Error::Api { code, message } => write!(f, "api {code}: {message}"),
             Error::Protocol(m) => write!(f, "protocol: {m}"),
@@ -87,8 +92,28 @@ impl PaneInfo {
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
+pub struct WorkspaceWorktree {
+    pub repo_name: String,
+    pub checkout_path: String,
+}
+
+/// A sidebar space.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WorkspaceInfo {
+    pub workspace_id: String,
+    /// Display name: herdr defaults it to the cwd basename; `workspace rename` overwrites it.
+    pub label: String,
+    pub focused: bool,
+    pub pane_count: usize,
+    pub worktree: Option<WorkspaceWorktree>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
 pub struct Snapshot {
     pub panes: Vec<PaneInfo>,
+    pub workspaces: Vec<WorkspaceInfo>,
     pub focused_pane_id: Option<String>,
 }
 
@@ -135,20 +160,24 @@ impl Client {
         }
     }
 
-    /// One request per connection, like herdr's own CLI.
+    /// One request per connection, like herdr's own CLI. A transient socket failure
+    /// (EINVAL/ECONNRESET/EPIPE/EINTR or a response cut before its newline) is retried once on
+    /// a fresh connection; the retry is logged at debug level only.
     pub fn call(&self, method: &str, params: Value) -> Result<Value, Error> {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
         let id = format!("autolabel-{id}");
-        let mut stream = UnixStream::connect(&self.socket).map_err(Error::Connect)?;
-        stream.set_read_timeout(Some(TIMEOUT)).map_err(Error::Io)?;
-        stream.set_write_timeout(Some(TIMEOUT)).map_err(Error::Io)?;
         let mut line =
             serde_json::to_string(&json!({"id": id, "method": method, "params": params}))?;
         line.push('\n');
-        stream.write_all(line.as_bytes()).map_err(Error::Io)?;
-        stream.flush().map_err(Error::Io)?;
-        let response = read_frame(&mut stream, TIMEOUT)?;
+        let response = match self.exchange(&line) {
+            Err(e) if is_transient(&e) => {
+                crate::logging::log_debug!("{method}: {e}; retrying once");
+                std::thread::sleep(RETRY_DELAY);
+                self.exchange(&line)?
+            }
+            other => other?,
+        };
         let value: Value = serde_json::from_slice(&response)?;
         if value.get("id").and_then(Value::as_str) != Some(id.as_str()) {
             return Err(Error::Protocol("response id mismatch".into()));
@@ -173,6 +202,21 @@ impl Client {
             .ok_or_else(|| Error::Protocol("missing result".into()))
     }
 
+    /// Connects, writes one request line and reads one response frame.
+    fn exchange(&self, line: &str) -> Result<Vec<u8>, Error> {
+        let io = |step| move |err| Error::Io { step, err };
+        let mut stream = UnixStream::connect(&self.socket).map_err(Error::Connect)?;
+        // Socket options are set once, before the server can possibly have closed its end.
+        stream
+            .set_read_timeout(Some(TIMEOUT))
+            .map_err(io("set_read_timeout"))?;
+        stream
+            .set_write_timeout(Some(TIMEOUT))
+            .map_err(io("set_write_timeout"))?;
+        stream.write_all(line.as_bytes()).map_err(io("write"))?;
+        read_frame(&mut stream, TIMEOUT)
+    }
+
     /// Calls `method` and unwraps the typed payload: herdr wraps results as
     /// `{"type": "<variant>", "<key>": {...}}`.
     fn call_payload<T: serde::de::DeserializeOwned>(
@@ -195,6 +239,14 @@ impl Client {
 
     pub fn pane(&self, pane_id: &str) -> Result<PaneInfo, Error> {
         self.call_payload("pane.get", json!({"pane_id": pane_id}), "pane")
+    }
+
+    pub fn workspace(&self, workspace_id: &str) -> Result<WorkspaceInfo, Error> {
+        self.call_payload(
+            "workspace.get",
+            json!({"workspace_id": workspace_id}),
+            "workspace",
+        )
     }
 
     pub fn process_info(&self, pane_id: &str) -> Result<ProcessInfo, Error> {
@@ -234,23 +286,45 @@ impl Client {
         )?;
         Ok(())
     }
+
+    /// Sets a workspace (sidebar space) label. This is the same user-visible name that
+    /// `herdr workspace rename` sets; herdr has no display-only title for workspaces.
+    pub fn rename_workspace(&self, workspace_id: &str, label: &str) -> Result<(), Error> {
+        self.call(
+            "workspace.rename",
+            json!({"workspace_id": workspace_id, "label": label}),
+        )?;
+        Ok(())
+    }
+}
+
+/// Errors worth one immediate retry on a fresh connection: the kernel occasionally fails a
+/// socket syscall on a connection the server is tearing down (macOS reports EINVAL for it,
+/// Linux ECONNRESET/EPIPE), and a response cut before its newline is the same race.
+fn is_transient(err: &Error) -> bool {
+    match err {
+        Error::Io { err, .. } => matches!(
+            err.raw_os_error(),
+            Some(libc::EINVAL | libc::ECONNRESET | libc::EPIPE | libc::EINTR | libc::ECONNABORTED)
+        ),
+        Error::Protocol(m) => m.starts_with("response ended"),
+        _ => false,
+    }
 }
 
 fn read_frame(stream: &mut UnixStream, timeout: Duration) -> Result<Vec<u8>, Error> {
     let deadline = Instant::now() + timeout;
     let mut response = Vec::new();
     let mut buffer = [0; 4096];
+    // The caller armed SO_RCVTIMEO right after connecting; it must not be touched again:
+    // herdr closes the connection as soon as it has written the response (one request per
+    // connection), and once the peer has closed, macOS rejects any setsockopt on the socket
+    // with EINVAL even though the unread tail of the response is still buffered. That was the
+    // intermittent `pass failed: io: Invalid argument (os error 22)` on multi-chunk frames.
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(Error::Io(std::io::ErrorKind::TimedOut.into()));
-        }
-        // Darwin rejects timeval values whose rounded microsecond field reaches 1,000,000.
-        let remaining = Duration::from_micros(remaining.as_micros().max(1) as u64);
-        stream
-            .set_read_timeout(Some(remaining))
-            .map_err(Error::Io)?;
-        let n = stream.read(&mut buffer).map_err(Error::Io)?;
+        let n = stream
+            .read(&mut buffer)
+            .map_err(|err| Error::Io { step: "read", err })?;
         if n == 0 {
             return Err(Error::Protocol("response ended before newline".into()));
         }
@@ -259,6 +333,12 @@ fn read_frame(stream: &mut UnixStream, timeout: Duration) -> Result<Vec<u8>, Err
             return Ok(response);
         }
         response.extend_from_slice(&buffer[..n]);
+        if Instant::now() >= deadline {
+            return Err(Error::Io {
+                step: "read",
+                err: std::io::ErrorKind::TimedOut.into(),
+            });
+        }
     }
 }
 
@@ -342,14 +422,18 @@ mod tests {
     #[test]
     fn frame_requires_newline_and_obeys_deadline() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
         server.write_all(b"{}").unwrap();
         assert!(matches!(
             read_frame(&mut client, Duration::from_millis(20)),
-            Err(Error::Io(_))
+            Err(Error::Io { .. })
         ));
         drop(server);
         assert!(read_frame(&mut client, TIMEOUT).is_err());
         let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(TIMEOUT)).unwrap();
         let writer = std::thread::spawn(move || {
             server.write_all(b"{\"ok\":").unwrap();
             std::thread::sleep(Duration::from_millis(10));
@@ -357,6 +441,21 @@ mod tests {
         });
         assert_eq!(read_frame(&mut client, TIMEOUT).unwrap(), b"{\"ok\":true}");
         writer.join().unwrap();
+    }
+
+    #[test]
+    fn multi_chunk_frame_survives_peer_closing_first() {
+        // herdr writes the response and closes immediately; a frame larger than one read
+        // buffer must still be assembled (re-arming SO_RCVTIMEO here fails with EINVAL on
+        // macOS once the peer is gone).
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.set_read_timeout(Some(TIMEOUT)).unwrap();
+        let body = format!("{{\"pad\":\"{}\"}}", "x".repeat(6_000));
+        server.write_all(body.as_bytes()).unwrap();
+        server.write_all(b"\n").unwrap();
+        drop(server);
+        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(read_frame(&mut client, TIMEOUT).unwrap(), body.as_bytes());
     }
 
     #[test]
@@ -399,5 +498,78 @@ mod tests {
     fn missing_socket_is_connect_error() {
         let c = Client::new("/nonexistent/herdr.sock");
         assert!(matches!(c.snapshot(), Err(Error::Connect(_))));
+    }
+}
+
+#[cfg(test)]
+mod stress {
+    //! `cargo nextest run --run-ignored ignored-only stress` — hammers one-shot exchanges against
+    //! a local server to surface intermittent socket errors (the EINVAL papercut).
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    #[ignore]
+    fn one_shot_exchanges_under_load() {
+        let sock = std::env::temp_dir().join(format!("hal-stress-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                std::thread::spawn(move || {
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        return;
+                    }
+                    let req: Value = serde_json::from_str(&line).unwrap_or_default();
+                    let mut stream = stream;
+                    let body = "x".repeat(20_000);
+                    let _ = writeln!(
+                        stream,
+                        "{}",
+                        json!({"id": req["id"], "result": {"type": "ok", "pad": body}})
+                    );
+                });
+            }
+        });
+        let rounds: usize = std::env::var("STRESS_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3000);
+        let workers: Vec<_> = (0..8)
+            .map(|w| {
+                let sock = sock.clone();
+                std::thread::spawn(move || {
+                    let client = Client::new(&sock);
+                    let mut errors = Vec::new();
+                    for i in 0..rounds {
+                        let line = format!(
+                            "{}\n",
+                            json!({"id": format!("s{w}-{i}"), "method": "ping", "params": {}})
+                        );
+                        if let Err(e) = client.exchange(&line) {
+                            errors.push(e.to_string());
+                        }
+                    }
+                    errors
+                })
+            })
+            .collect();
+        let errors: Vec<String> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        let _ = std::fs::remove_file(&sock);
+        eprintln!(
+            "stress: {} errors over {} exchanges",
+            errors.len(),
+            rounds * 8
+        );
+        for e in errors.iter().take(20) {
+            eprintln!("  {e}");
+        }
+        assert!(errors.is_empty(), "{errors:?}");
     }
 }

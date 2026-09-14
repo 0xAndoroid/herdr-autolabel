@@ -10,11 +10,12 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::fingerprint::{self, Fingerprint};
-use crate::herdr::{self, Client, PaneInfo};
+use crate::herdr::{self, Client, PaneInfo, Snapshot};
 use crate::heuristics::{self, Decision, PaneFacts, Proc};
 use crate::llm;
 use crate::logging::{log_debug, log_info, log_warn};
 use crate::ratelimit::RateLimiter;
+use crate::spaces::{self, PaneSummary, SpaceStates};
 
 const MAX_CONNECT_FAILURES: u32 = 3;
 const CACHE_CAPACITY: usize = 256;
@@ -64,6 +65,12 @@ impl Paths {
     pub fn config_file(&self) -> PathBuf {
         self.config_dir.join("config.toml")
     }
+
+    /// Space ownership state, per socket like the pidfile.
+    pub fn spaces_file(&self) -> PathBuf {
+        let h = fingerprint::hash_str(&self.socket.to_string_lossy());
+        self.state_dir.join(format!("spaces-{h:016x}.json"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -78,6 +85,10 @@ pub enum Source {
     SkippedManual,
     SkippedFilter,
     SkippedTitle,
+    /// Space label derived from its panes.
+    Aggregate,
+    /// Space candidate waiting out the hysteresis window.
+    Pending,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +99,23 @@ pub struct Outcome {
     pub applied: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct SpaceOutcome {
+    pub workspace_id: String,
+    pub label: Option<String>,
+    pub source: Source,
+    pub applied: bool,
+}
+
+/// A pane's current label as seen by space aggregation, whether or not it was written as a
+/// title.
+#[derive(Debug, Clone)]
+struct PaneLabel {
+    label: String,
+    agent: bool,
+    scope: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct PassStats {
     pub panes: usize,
@@ -96,6 +124,9 @@ pub struct PassStats {
     pub skipped: usize,
     pub llm_calls: usize,
     pub llm_errors: usize,
+    pub spaces: usize,
+    pub spaces_labeled: usize,
+    pub spaces_skipped: usize,
     pub duration_ms: u128,
 }
 
@@ -145,6 +176,10 @@ pub struct Daemon {
     last_fp: HashMap<String, u64>,
     /// Title we last reported per pane.
     applied: HashMap<String, String>,
+    /// Current label per pane, written or not (`label_panes = false`, manual names, …).
+    labels: HashMap<String, PaneLabel>,
+    /// Space ownership + hysteresis, mirrored in `Paths::spaces_file`.
+    spaces: SpaceStates,
     /// A different title owner was observed; leave the pane alone until it closes.
     /// Panes whose title we cleared because of a manual label.
     cleared: HashSet<String>,
@@ -152,6 +187,7 @@ pub struct Daemon {
     pass_count: u64,
     total_llm_calls: u64,
     total_applied: u64,
+    total_spaces_applied: u64,
     last_error: Option<String>,
 }
 
@@ -169,11 +205,14 @@ impl Daemon {
             cache: LabelCache::new(),
             last_fp: HashMap::new(),
             applied: HashMap::new(),
+            labels: HashMap::new(),
+            spaces: SpaceStates::new(),
             cleared: HashSet::new(),
             started_at: crate::logging::timestamp(),
             pass_count: 0,
             total_llm_calls: 0,
             total_applied: 0,
+            total_spaces_applied: 0,
             last_error: None,
             config,
             provider,
@@ -200,7 +239,7 @@ impl Daemon {
                 break;
             }
             match self.pass(false) {
-                Ok((stats, _)) => {
+                Ok((stats, _, _)) => {
                     connect_failures = 0;
                     log_debug!("pass {} {:?}", self.pass_count, stats);
                 }
@@ -225,11 +264,17 @@ impl Daemon {
                 std::thread::sleep(Duration::from_millis(250));
             }
         }
+        if self.config.label_spaces {
+            self.restore_spaces();
+        }
         self.write_status(false);
     }
 
     /// One pass over all panes. `force` ignores fingerprints and re-applies every label.
-    pub fn pass(&mut self, force: bool) -> Result<(PassStats, Vec<Outcome>), herdr::Error> {
+    pub fn pass(
+        &mut self,
+        force: bool,
+    ) -> Result<(PassStats, Vec<Outcome>, Vec<SpaceOutcome>), herdr::Error> {
         let started = Instant::now();
         let snapshot = self.client.snapshot()?;
         self.pass_count += 1;
@@ -241,6 +286,7 @@ impl Daemon {
         let alive: HashSet<String> = snapshot.panes.iter().map(|p| p.pane_id.clone()).collect();
         self.last_fp.retain(|k, _| alive.contains(k));
         self.applied.retain(|k, _| alive.contains(k));
+        self.labels.retain(|k, _| alive.contains(k));
         self.cleared.retain(|k| alive.contains(k));
 
         for pane in &snapshot.panes {
@@ -250,8 +296,13 @@ impl Daemon {
             let outcome = self.handle_pane(pane, force, &mut stats)?;
             outcomes.push(outcome);
         }
+        let spaces = if self.config.label_spaces && !SHUTDOWN.load(Ordering::Relaxed) {
+            self.handle_spaces(&snapshot, force, &mut stats)?
+        } else {
+            Vec::new()
+        };
         stats.duration_ms = started.elapsed().as_millis();
-        Ok((stats, outcomes))
+        Ok((stats, outcomes, spaces))
     }
 
     fn handle_pane(
@@ -270,6 +321,27 @@ impl Daemon {
         };
 
         if let Some(source) = self.skip_pane(pane, stats)? {
+            // Skipped panes still tell their space what they show.
+            let shown = match source {
+                Source::SkippedManual => pane.label.clone(),
+                Source::SkippedTitle => pane.title.clone(),
+                _ => None,
+            };
+            match shown.filter(|s| !s.trim().is_empty()) {
+                Some(label) => {
+                    self.labels.insert(
+                        id.clone(),
+                        PaneLabel {
+                            label: label.trim().to_string(),
+                            agent: pane.agent.as_deref().is_some_and(|a| !a.is_empty()),
+                            scope: None,
+                        },
+                    );
+                }
+                None => {
+                    self.labels.remove(&id);
+                }
+            }
             return Ok(outcome(None, source, false));
         }
 
@@ -338,90 +410,276 @@ impl Daemon {
 
         if !force && self.last_fp.get(&id) == Some(&fp) {
             stats.unchanged += 1;
-            if let Some(ours) = self.applied.get(&id).cloned()
+            if self.config.label_panes
+                && let Some(ours) = self.applied.get(&id).cloned()
                 && pane.title.is_none()
             {
                 let applied = self.apply(&id, &ours, stats)?;
                 return Ok(outcome(Some(ours), Source::Unchanged, applied));
             }
             return Ok(outcome(
-                self.applied.get(&id).cloned(),
+                self.labels.get(&id).map(|l| l.label.clone()),
                 Source::Unchanged,
                 false,
             ));
         }
 
-        let (label, source) = match heuristics::decide(&facts, self.config.max_chars) {
-            Decision::Label(l) => (l, Source::Heuristic),
+        let (label, source, record_fp) = match heuristics::decide(&facts, self.config.max_chars) {
+            Decision::Label(l) => (l, Source::Heuristic, true),
             Decision::Llm { fallback } => {
                 if let Some(cached) = self.cache.get(fp) {
-                    (cached, Source::Cache)
+                    (cached, Source::Cache, true)
                 } else if let Some(provider) = self.provider.clone() {
                     if !self
                         .limiter
                         .try_acquire(&format!("{}:{id}", self.paths.socket.display()))
                     {
                         log_debug!("{id}: llm rate-limited; keeping previous label");
-                        // Don't record the fingerprint so the next pass retries.
-                        if !self.applied.contains_key(&id) {
-                            let applied = self.apply(&id, &fallback, stats)?;
-                            return Ok(outcome(Some(fallback), Source::RateLimited, applied));
-                        }
-                        return Ok(outcome(
-                            self.applied.get(&id).cloned(),
-                            Source::RateLimited,
-                            false,
-                        ));
-                    }
-                    stats.llm_calls += 1;
-                    self.total_llm_calls += 1;
-                    let fg_cmdline = fg.as_ref().map(|p| p.argv.join(" "));
-                    let cwd_base = heuristics::basename(cwd.trim_end_matches('/'));
-                    let ctx = llm::Context {
-                        agent: facts.agent.as_deref(),
-                        agent_status: facts.agent.as_ref().map(|_| agent_status.as_str()),
-                        process: fg_cmdline.as_deref(),
-                        cwd_basename: &cwd_base,
-                        branch: branch.as_deref(),
-                        lines: &lines,
-                    };
-                    let t0 = Instant::now();
-                    match provider.label(&ctx, self.config.max_chars) {
-                        Ok(l) => {
-                            log_info!(
-                                "{id}: llm {} → {l:?} ({} ms)",
-                                provider,
-                                t0.elapsed().as_millis()
-                            );
-                            self.cache.insert(fp, l.clone());
-                            (l, Source::Llm)
-                        }
-                        Err(e) => {
-                            stats.llm_errors += 1;
-                            self.last_error = Some(format!("llm: {e}"));
-                            log_warn!("{id}: llm failed ({e}); fallback {fallback:?}");
-                            (fallback, Source::Fallback)
+                        // Keep the previous label (or the fallback when there is none) and don't
+                        // record the fingerprint so the next pass retries.
+                        let previous = self.labels.get(&id).map(|l| l.label.clone());
+                        (previous.unwrap_or(fallback), Source::RateLimited, false)
+                    } else {
+                        stats.llm_calls += 1;
+                        self.total_llm_calls += 1;
+                        let fg_cmdline = fg.as_ref().map(|p| p.argv.join(" "));
+                        let cwd_base = heuristics::basename(cwd.trim_end_matches('/'));
+                        let ctx = llm::Context {
+                            agent: facts.agent.as_deref(),
+                            agent_status: facts.agent.as_ref().map(|_| agent_status.as_str()),
+                            process: fg_cmdline.as_deref(),
+                            cwd_basename: &cwd_base,
+                            branch: branch.as_deref(),
+                            lines: &lines,
+                        };
+                        let t0 = Instant::now();
+                        match provider.label(&ctx, self.config.max_chars) {
+                            Ok(l) => {
+                                log_info!(
+                                    "{id}: llm {} → {l:?} ({} ms)",
+                                    provider,
+                                    t0.elapsed().as_millis()
+                                );
+                                self.cache.insert(fp, l.clone());
+                                (l, Source::Llm, true)
+                            }
+                            Err(e) => {
+                                stats.llm_errors += 1;
+                                self.last_error = Some(format!("llm: {e}"));
+                                log_warn!("{id}: llm failed ({e}); fallback {fallback:?}");
+                                (fallback, Source::Fallback, true)
+                            }
                         }
                     }
                 } else {
-                    (fallback, Source::Fallback)
+                    (fallback, Source::Fallback, true)
                 }
             }
         };
 
         if label.is_empty() {
+            self.labels.remove(&id);
             return Ok(outcome(None, source, false));
+        }
+        self.labels.insert(
+            id.clone(),
+            PaneLabel {
+                label: label.clone(),
+                agent: facts.agent.is_some()
+                    || fg.as_ref().and_then(heuristics::agent_of).is_some(),
+                scope: heuristics::scope(&facts),
+            },
+        );
+        if !self.config.label_panes {
+            if record_fp {
+                self.last_fp.insert(id.clone(), fp);
+            }
+            return Ok(outcome(Some(label), source, false));
         }
         let changed = self.applied.get(&id) != Some(&label);
         if changed || force {
             let applied = self.apply(&id, &label, stats)?;
-            if applied {
+            if applied && record_fp {
                 self.last_fp.insert(id.clone(), fp);
             }
             return Ok(outcome(Some(label), source, applied));
         }
-        self.last_fp.insert(id.clone(), fp);
+        if record_fp {
+            self.last_fp.insert(id.clone(), fp);
+        }
         Ok(outcome(Some(label), source, false))
+    }
+
+    /// Labels every sidebar space from the labels its panes got in this pass.
+    fn handle_spaces(
+        &mut self,
+        snapshot: &Snapshot,
+        force: bool,
+        stats: &mut PassStats,
+    ) -> Result<Vec<SpaceOutcome>, herdr::Error> {
+        // The state file is shared with one-shot runs (`once`), which may have renamed spaces
+        // since our last pass: take the file as truth and keep only the in-memory hysteresis.
+        let mut states = spaces::load_states(&self.paths.spaces_file());
+        for (id, state) in &mut states {
+            state.pending = self.spaces.get(id).and_then(|s| s.pending.clone());
+        }
+        let alive: HashSet<&str> = snapshot
+            .workspaces
+            .iter()
+            .map(|w| w.workspace_id.as_str())
+            .collect();
+        let before = states.len();
+        states.retain(|id, _| alive.contains(id.as_str()));
+        let mut dirty = states.len() != before;
+        stats.spaces = snapshot.workspaces.len();
+        let mut outcomes = Vec::with_capacity(snapshot.workspaces.len());
+
+        for ws in &snapshot.workspaces {
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                break;
+            }
+            let id = &ws.workspace_id;
+            let outcome = |label: Option<String>, source: Source, applied: bool| SpaceOutcome {
+                workspace_id: id.clone(),
+                label,
+                source,
+                applied,
+            };
+            let panes: Vec<&PaneInfo> = snapshot
+                .panes
+                .iter()
+                .filter(|p| p.workspace_id == *id)
+                .collect();
+            let defaults = spaces::default_names(
+                panes
+                    .iter()
+                    .flat_map(|p| [p.cwd.as_deref().unwrap_or(""), p.effective_cwd()]),
+                ws.worktree.as_ref().map(|w| w.repo_name.as_str()),
+                ws.worktree.as_ref().map(|w| w.checkout_path.as_str()),
+            );
+            let state = states.entry(id.clone()).or_default();
+            match spaces::classify(&ws.label, state, &defaults) {
+                spaces::Ownership::Manual => {
+                    if state.applied.take().is_some() {
+                        dirty = true;
+                        log_info!("{id}: space renamed by hand to {:?}; leaving it", ws.label);
+                    }
+                    state.pending = None;
+                    stats.spaces_skipped += 1;
+                    outcomes.push(outcome(
+                        Some(ws.label.clone()),
+                        Source::SkippedManual,
+                        false,
+                    ));
+                    continue;
+                }
+                spaces::Ownership::Default => {
+                    if state.applied.is_some() || state.original != ws.label {
+                        state.applied = None;
+                        state.original = ws.label.clone();
+                        dirty = true;
+                    }
+                }
+                spaces::Ownership::Ours => {}
+            }
+            let summaries: Vec<PaneSummary> = panes
+                .iter()
+                .filter_map(|p| {
+                    self.labels.get(&p.pane_id).map(|l| PaneSummary {
+                        label: l.label.clone(),
+                        agent: l.agent,
+                        focused: p.focused,
+                        scope: l.scope.clone(),
+                    })
+                })
+                .collect();
+            let candidate = spaces::aggregate(&summaries, self.config.max_chars);
+            let Some(next) = state.observe(candidate.as_deref(), force) else {
+                let source = if state.pending.is_some() {
+                    Source::Pending
+                } else {
+                    Source::Unchanged
+                };
+                outcomes.push(outcome(state.applied.clone(), source, false));
+                continue;
+            };
+            if next == ws.label {
+                // herdr's own name already says it (single `pika` pane in a `pika` space).
+                state.applied = Some(next.clone());
+                dirty = true;
+                outcomes.push(outcome(Some(next), Source::Aggregate, false));
+                continue;
+            }
+            // Pane labelling (and its LLM calls) ran after the snapshot; recheck the name.
+            let current = match self.client.workspace(id) {
+                Ok(w) => w,
+                Err(herdr::Error::Api { .. }) => continue, // closed meanwhile
+                Err(e) => return Err(e),
+            };
+            if current.label != ws.label {
+                log_debug!("{id}: space renamed during the pass; skipping");
+                outcomes.push(outcome(None, Source::SkippedManual, false));
+                continue;
+            }
+            self.client.rename_workspace(id, &next)?;
+            state.applied = Some(next.clone());
+            dirty = true;
+            stats.spaces_labeled += 1;
+            self.total_spaces_applied += 1;
+            log_debug!("{id}: space ← {next:?}");
+            outcomes.push(outcome(Some(next), Source::Aggregate, true));
+        }
+        if dirty && let Err(e) = spaces::save_states(&self.paths.spaces_file(), &states) {
+            log_warn!("spaces state write failed: {e}");
+        }
+        self.spaces = states;
+        Ok(outcomes)
+    }
+
+    /// Puts back the names spaces had before we renamed them; only spaces still carrying one
+    /// of our labels are touched.
+    pub fn restore_spaces(&mut self) {
+        let mut states = spaces::load_states(&self.paths.spaces_file());
+        if states.values().all(|s| s.applied.is_none()) {
+            return;
+        }
+        let snapshot = match self.client.snapshot() {
+            Ok(s) => s,
+            Err(e) => {
+                log_warn!("cannot restore space names: {e}");
+                return;
+            }
+        };
+        for ws in &snapshot.workspaces {
+            let Some(state) = states.get_mut(&ws.workspace_id) else {
+                continue;
+            };
+            if state.applied.as_deref() != Some(ws.label.as_str()) || state.original.is_empty() {
+                continue;
+            }
+            if state.original == ws.label {
+                state.applied = None;
+                continue;
+            }
+            match self
+                .client
+                .rename_workspace(&ws.workspace_id, &state.original)
+            {
+                Ok(()) => {
+                    log_debug!(
+                        "{}: space restored to {:?}",
+                        ws.workspace_id,
+                        state.original
+                    );
+                    state.applied = None;
+                }
+                Err(e) => log_warn!("{}: restore failed: {e}", ws.workspace_id),
+            }
+        }
+        if let Err(e) = spaces::save_states(&self.paths.spaces_file(), &states) {
+            log_warn!("spaces state write failed: {e}");
+        }
+        self.spaces = states;
     }
 
     fn skip_pane(
@@ -506,6 +764,8 @@ impl Daemon {
             "panes_labeled": self.applied.len(),
             "llm_calls": self.total_llm_calls,
             "titles_applied": self.total_applied,
+            "spaces_labeled": self.spaces.values().filter(|s| s.applied.is_some()).count(),
+            "space_labels_applied": self.total_spaces_applied,
             "last_pass": last_pass,
             "last_error": self.last_error,
         })
@@ -536,10 +796,30 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Joins the mock server and removes its state dir (only once the daemon is done with it).
+    fn finish(
+        daemon: &Daemon,
+        server: std::thread::JoinHandle<Vec<serde_json::Value>>,
+    ) -> Vec<serde_json::Value> {
+        let seen = server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
+        seen
+    }
+
     fn mock_daemon(
         name: &str,
         replies: Vec<(&'static str, serde_json::Value)>,
-    ) -> (Daemon, std::thread::JoinHandle<()>) {
+    ) -> (Daemon, std::thread::JoinHandle<Vec<serde_json::Value>>) {
+        mock_daemon_with(name, Config::default(), replies)
+    }
+
+    /// Serves `replies` in order, one connection each, asserting the method of every request;
+    /// joining the server yields the requests it saw.
+    fn mock_daemon_with(
+        name: &str,
+        config: Config,
+        replies: Vec<(&'static str, serde_json::Value)>,
+    ) -> (Daemon, std::thread::JoinHandle<Vec<serde_json::Value>>) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         // Unique per invocation so concurrent tests never share sockets or budget files.
@@ -557,6 +837,7 @@ mod tests {
             config_dir: dir.clone(),
         };
         let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
             for (method, response) in replies {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut line = String::new();
@@ -564,17 +845,18 @@ mod tests {
                     .read_line(&mut line)
                     .unwrap();
                 let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(request["method"], method);
+                assert_eq!(request["method"], method, "request {}", seen.len());
                 if method == "pane.report_metadata" {
                     assert_eq!(request["params"]["source"], herdr::SOURCE);
                 }
                 let mut response = response;
                 response["id"] = request["id"].clone();
                 writeln!(stream, "{response}").unwrap();
+                seen.push(request);
             }
-            std::fs::remove_dir_all(&dir).unwrap();
+            seen
         });
-        (Daemon::new(paths, Config::default(), None), server)
+        (Daemon::new(paths, config, None), server)
     }
 
     #[test]
@@ -618,7 +900,7 @@ mod tests {
                 assert!(outcome.applied);
                 assert!(daemon.applied.contains_key("p1"));
             }
-            server.join().unwrap();
+            finish(&daemon, server);
         }
     }
 
@@ -644,7 +926,7 @@ mod tests {
         assert!(daemon.handle_pane(&pane, false, &mut stats).is_err());
         assert!(daemon.handle_pane(&pane, false, &mut stats).is_ok());
         assert!(daemon.handle_pane(&pane, false, &mut stats).is_ok());
-        server.join().unwrap();
+        finish(&daemon, server);
     }
 
     #[test]
@@ -679,7 +961,7 @@ mod tests {
                 .unwrap()
                 .applied
         );
-        server.join().unwrap();
+        finish(&daemon, server);
     }
 
     #[test]
@@ -706,7 +988,286 @@ mod tests {
                 .applied
         );
         assert!(daemon.last_fp.is_empty());
-        server.join().unwrap();
+        finish(&daemon, server);
+    }
+
+    fn ws(id: &str, label: &str, focused: bool) -> serde_json::Value {
+        json!({"workspace_id": id, "label": label, "focused": focused, "pane_count": 1})
+    }
+
+    fn pane_json(
+        id: &str,
+        ws: &str,
+        cwd: &str,
+        focused: bool,
+        title: Option<&str>,
+    ) -> serde_json::Value {
+        json!({"pane_id": id, "workspace_id": ws, "cwd": cwd, "focused": focused, "title": title})
+    }
+
+    fn snapshot(
+        panes: Vec<serde_json::Value>,
+        workspaces: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        json!({"result": {"snapshot": {"panes": panes, "workspaces": workspaces}}})
+    }
+
+    fn labelled_pane(id: &str) -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("pane.process_info", json!({"result": {"process_info": {}}})),
+            ("pane.read", json!({"result": {"read": {"text": ""}}})),
+            ("pane.get", json!({"result": {"pane": {"pane_id": id}}})),
+            ("pane.report_metadata", json!({"result": {"type": "ok"}})),
+        ]
+    }
+
+    fn unchanged_pane() -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            ("pane.process_info", json!({"result": {"process_info": {}}})),
+            ("pane.read", json!({"result": {"read": {"text": ""}}})),
+        ]
+    }
+
+    #[test]
+    fn spaces_follow_their_panes_with_hysteresis_and_restore_on_stop() {
+        // Two fake repos (a `.git` dir is enough for repo/branch detection).
+        let root = std::env::temp_dir().join(format!("hal-spaces-repos-{}", std::process::id()));
+        for d in [
+            "pika/.git",
+            "pika/crates",
+            "pika/src",
+            "jolt/.git",
+            "jolt/sub",
+        ] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+        // w1: one pane in pika/crates → the space (herdr-named "pika") takes the pane label
+        // "crates" verbatim. w2: two panes in the jolt repo → dominant scope "jolt", which is
+        // already the space's own name → recorded, not renamed.
+        let mut replies = vec![(
+            "session.snapshot",
+            snapshot(
+                vec![
+                    pane_json("w1:p1", "w1", &p("pika/crates"), false, None),
+                    pane_json("w2:p1", "w2", &p("jolt"), true, None),
+                    pane_json("w2:p2", "w2", &p("jolt/sub"), false, None),
+                ],
+                vec![ws("w1", "pika", false), ws("w2", "jolt", true)],
+            ),
+        )];
+        replies.extend(labelled_pane("w1:p1"));
+        replies.extend(labelled_pane("w2:p1"));
+        replies.extend(labelled_pane("w2:p2"));
+        replies.extend([
+            (
+                "workspace.get",
+                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
+            ),
+            ("workspace.rename", json!({"result": {"type": "ok"}})),
+        ]);
+        // Pass 2: w1's pane moved to pika/src → pane relabelled at once, space waits.
+        let pass2_panes = vec![
+            pane_json("w1:p1", "w1", &p("pika/src"), false, Some("crates")),
+            pane_json("w2:p1", "w2", &p("jolt"), true, Some("jolt")),
+            pane_json("w2:p2", "w2", &p("jolt/sub"), false, Some("sub")),
+        ];
+        let pass2_ws = vec![ws("w1", "crates", false), ws("w2", "jolt", true)];
+        replies.push(("session.snapshot", snapshot(pass2_panes, pass2_ws.clone())));
+        replies.extend(labelled_pane("w1:p1"));
+        replies.extend(unchanged_pane());
+        replies.extend(unchanged_pane());
+        // Pass 3: same picture again → the space follows.
+        let pass3_panes = vec![
+            pane_json("w1:p1", "w1", &p("pika/src"), false, Some("src")),
+            pane_json("w2:p1", "w2", &p("jolt"), true, Some("jolt")),
+            pane_json("w2:p2", "w2", &p("jolt/sub"), false, Some("sub")),
+        ];
+        replies.push(("session.snapshot", snapshot(pass3_panes.clone(), pass2_ws)));
+        for _ in 0..3 {
+            replies.extend(unchanged_pane());
+        }
+        replies.extend([
+            (
+                "workspace.get",
+                json!({"result": {"workspace": {"workspace_id": "w1", "label": "crates"}}}),
+            ),
+            ("workspace.rename", json!({"result": {"type": "ok"}})),
+        ]);
+        // Stop: w1 goes back to "pika"; w2 never changed name.
+        replies.push((
+            "session.snapshot",
+            snapshot(
+                pass3_panes,
+                vec![ws("w1", "src", false), ws("w2", "jolt", true)],
+            ),
+        ));
+        replies.push(("workspace.rename", json!({"result": {"type": "ok"}})));
+
+        let (mut daemon, server) = mock_daemon("spaces", replies);
+        let (stats, panes, spaces) = daemon.pass(false).unwrap();
+        assert_eq!(stats.spaces, 2);
+        assert_eq!(stats.spaces_labeled, 1);
+        assert_eq!(panes.iter().filter(|o| o.applied).count(), 3);
+        let by_id = |v: &[SpaceOutcome], id: &str| {
+            v.iter().find(|o| o.workspace_id == id).cloned().unwrap()
+        };
+        assert_eq!(by_id(&spaces, "w1").label.as_deref(), Some("crates"));
+        assert!(by_id(&spaces, "w1").applied);
+        assert_eq!(by_id(&spaces, "w2").label.as_deref(), Some("jolt"));
+        assert!(!by_id(&spaces, "w2").applied);
+        let states = spaces::load_states(&daemon.paths.spaces_file());
+        assert_eq!(states["w1"].original, "pika");
+        assert_eq!(states["w1"].applied.as_deref(), Some("crates"));
+        assert_eq!(states["w2"].applied.as_deref(), Some("jolt"));
+
+        let (stats, _, spaces) = daemon.pass(false).unwrap();
+        assert_eq!(stats.spaces_labeled, 0);
+        assert_eq!(by_id(&spaces, "w1").source, Source::Pending);
+        assert_eq!(by_id(&spaces, "w1").label.as_deref(), Some("crates"));
+
+        let (stats, _, spaces) = daemon.pass(false).unwrap();
+        assert_eq!(stats.spaces_labeled, 1);
+        assert_eq!(by_id(&spaces, "w1").label.as_deref(), Some("src"));
+        assert!(by_id(&spaces, "w1").applied);
+
+        daemon.restore_spaces();
+        let states = spaces::load_states(&daemon.paths.spaces_file());
+        assert_eq!(states["w1"].applied, None);
+        assert_eq!(states["w2"].applied, None);
+
+        let seen = finish(&daemon, server);
+        let renames: Vec<(String, String)> = seen
+            .iter()
+            .filter(|r| r["method"] == "workspace.rename")
+            .map(|r| {
+                (
+                    r["params"]["workspace_id"].as_str().unwrap().to_string(),
+                    r["params"]["label"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            renames,
+            vec![
+                ("w1".to_string(), "crates".to_string()),
+                ("w1".to_string(), "src".to_string()),
+                ("w1".to_string(), "pika".to_string()),
+            ]
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn hand_named_spaces_are_never_renamed() {
+        // "my project" is neither a cwd/repo basename nor one of ours → left alone; a space we
+        // named that the user renamed afterwards is released.
+        let mut replies = vec![(
+            "session.snapshot",
+            snapshot(
+                vec![
+                    pane_json("w1:p1", "w1", "/x/pika", true, None),
+                    pane_json("w2:p1", "w2", "/x/jolt", false, None),
+                ],
+                vec![ws("w1", "my project", true), ws("w2", "handpicked", false)],
+            ),
+        )];
+        replies.extend(labelled_pane("w1:p1"));
+        replies.extend(labelled_pane("w2:p1"));
+        let (mut daemon, server) = mock_daemon("manual-spaces", replies);
+        let mut states = spaces::SpaceStates::new();
+        states.insert(
+            "w2".into(),
+            spaces::SpaceState {
+                original: "jolt".into(),
+                applied: Some("cargo build".into()),
+                pending: None,
+            },
+        );
+        spaces::save_states(&daemon.paths.spaces_file(), &states).unwrap();
+        let (stats, _, spaces) = daemon.pass(false).unwrap();
+        assert_eq!(stats.spaces_skipped, 2);
+        assert_eq!(stats.spaces_labeled, 0);
+        assert!(
+            spaces
+                .iter()
+                .all(|o| o.source == Source::SkippedManual && !o.applied)
+        );
+        let states = spaces::load_states(&daemon.paths.spaces_file());
+        assert_eq!(
+            states["w2"].applied, None,
+            "released after the user's rename"
+        );
+        // Nothing to restore either.
+        daemon.restore_spaces();
+        assert!(
+            finish(&daemon, server)
+                .iter()
+                .all(|r| r["method"] != "workspace.rename")
+        );
+    }
+
+    #[test]
+    fn panes_off_still_feed_spaces() {
+        let root = std::env::temp_dir().join(format!("hal-panes-off-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("pika/.git")).unwrap();
+        std::fs::create_dir_all(root.join("pika/crates")).unwrap();
+        let cwd = root.join("pika/crates").to_string_lossy().into_owned();
+        let mut replies = vec![(
+            "session.snapshot",
+            snapshot(
+                vec![pane_json("w1:p1", "w1", &cwd, true, None)],
+                vec![ws("w1", "pika", true)],
+            ),
+        )];
+        replies.extend(unchanged_pane());
+        replies.extend([
+            (
+                "workspace.get",
+                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
+            ),
+            ("workspace.rename", json!({"result": {"type": "ok"}})),
+        ]);
+        let config = Config::parse("label_panes = false\n").unwrap();
+        let (mut daemon, server) = mock_daemon_with("panes-off", config, replies);
+        let (stats, panes, spaces) = daemon.pass(false).unwrap();
+        assert_eq!(stats.labeled, 0);
+        assert_eq!(panes[0].label.as_deref(), Some("crates"));
+        assert!(!panes[0].applied);
+        assert!(daemon.applied.is_empty());
+        assert_eq!(spaces[0].label.as_deref(), Some("crates"));
+        assert!(spaces[0].applied);
+        let seen = finish(&daemon, server);
+        assert!(seen.iter().all(|r| r["method"] != "pane.report_metadata"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn manual_pane_labels_count_for_their_space() {
+        let replies = vec![
+            (
+                "session.snapshot",
+                snapshot(
+                    vec![
+                        json!({"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/x/pika",
+                        "focused": true, "label": "billing rewrite"}),
+                    ],
+                    vec![ws("w1", "pika", true)],
+                ),
+            ),
+            (
+                "workspace.get",
+                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
+            ),
+            ("workspace.rename", json!({"result": {"type": "ok"}})),
+        ];
+        let (mut daemon, server) = mock_daemon("manual-pane", replies);
+        let (stats, panes, spaces) = daemon.pass(false).unwrap();
+        assert_eq!(panes[0].source, Source::SkippedManual);
+        assert_eq!(stats.spaces_labeled, 1);
+        assert_eq!(spaces[0].label.as_deref(), Some("billing rewrite"));
+        let seen = finish(&daemon, server);
+        assert_eq!(seen.last().unwrap()["params"]["label"], "billing rewrite");
     }
 
     #[test]

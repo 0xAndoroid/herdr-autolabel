@@ -18,6 +18,19 @@ pub fn branch_for(cwd: &Path) -> Option<String> {
     None
 }
 
+/// Basename of the repository checkout containing `cwd` (the directory holding `.git`).
+pub fn repo_basename(cwd: &Path) -> Option<String> {
+    let mut dir = Some(cwd);
+    for _ in 0..=MAX_PARENT_WALK {
+        let d = dir?;
+        if git_dir_at(d).is_some() {
+            return d.file_name().map(|n| n.to_string_lossy().into_owned());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
 /// Resolves `<dir>/.git` to the directory holding `HEAD` (handles worktree `.git` files).
 fn git_dir_at(dir: &Path) -> Option<PathBuf> {
     let dot_git = dir.join(".git");

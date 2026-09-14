@@ -2,7 +2,7 @@
 name = "herdr-autolabel"
 version = "0.1.0"
 edition = "2024"
-description = "herdr plugin daemon that labels every pane with a terse title describing what is happening in it"
+description = "herdr plugin daemon that labels every pane and sidebar space with a terse title describing what is happening in it"
 license = "MIT"
 publish = false
 

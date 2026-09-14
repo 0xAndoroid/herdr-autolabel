@@ -217,6 +217,25 @@ fn is_default_branch(branch: &str) -> bool {
     matches!(branch, "main" | "master" | "trunk" | "develop")
 }
 
+/// What groups panes of one space together: the non-default branch, else the repository
+/// checkout name, else the cwd basename. `None` without a cwd.
+pub fn scope(facts: &PaneFacts) -> Option<String> {
+    if let Some(b) = facts
+        .branch
+        .as_deref()
+        .filter(|b| !b.is_empty() && !is_default_branch(b))
+    {
+        return Some(b.to_string());
+    }
+    let cwd = facts.cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        return None;
+    }
+    crate::git::repo_basename(Path::new(cwd))
+        .or_else(|| Some(basename(cwd)))
+        .filter(|s| !s.is_empty())
+}
+
 fn idle_label(facts: &PaneFacts) -> String {
     match &facts.branch {
         Some(b) if !b.is_empty() && !is_default_branch(b) => b.clone(),

@@ -16,6 +16,10 @@ pub struct Config {
     pub llm_global_per_min: u32,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
+    /// Title panes (pane borders) with their activity label.
+    pub label_panes: bool,
+    /// Rename sidebar spaces (workspaces) after the activity of their panes.
+    pub label_spaces: bool,
 }
 
 impl Default for Config {
@@ -30,6 +34,8 @@ impl Default for Config {
             llm_global_per_min: 6,
             allow: Vec::new(),
             deny: Vec::new(),
+            label_panes: true,
+            label_spaces: true,
         }
     }
 }
@@ -57,7 +63,9 @@ impl Config {
             llm_per_pane_secs,
             llm_global_per_min,
             allow,
-            deny
+            deny,
+            label_panes,
+            label_spaces
         );
         config.sanitize();
         Ok(config)
@@ -148,6 +156,7 @@ mod tests {
         assert_eq!(c.llm_per_pane_secs, 15);
         assert_eq!(c.llm_global_per_min, 6);
         assert!(c.allow.is_empty() && c.deny.is_empty());
+        assert!(c.label_panes && c.label_spaces);
     }
 
     #[test]
@@ -158,6 +167,13 @@ mod tests {
         assert_eq!(c.provider, "anthropic");
         assert_eq!(c.deny, vec!["w9*".to_string()]);
         assert_eq!(c.max_chars, 24);
+    }
+
+    #[test]
+    fn pane_and_space_toggles() {
+        let c = Config::parse("label_panes = false\nlabel_spaces = \"yes\"\n").unwrap();
+        assert!(!c.label_panes);
+        assert!(c.label_spaces, "invalid value keeps the default");
     }
 
     #[test]

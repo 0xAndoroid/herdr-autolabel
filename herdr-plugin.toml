@@ -1,7 +1,7 @@
 # herdr-autolabel — labels every pane with a terse title describing what is happening in it.
 # Install: cargo build --release && herdr plugin link ~/dev/herdr-autolabel
 id = "andoroid.autolabel"
-name = "Auto-label panes"
+name = "Auto-label panes and spaces"
 version = "0.1.0"
 min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
@@ -28,6 +28,6 @@ command = ["target/release/herdr-autolabel", "stop"]
 
 [[actions]]
 id = "relabel"
-title = "Relabel all panes now"
+title = "Relabel panes and spaces now"
 contexts = ["workspace"]
 command = ["target/release/herdr-autolabel", "once", "--force"]
