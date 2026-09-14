@@ -26,7 +26,7 @@ Manual renames always win: a pane with a `herdr pane rename` label is never titl
 
 ## Rate limits & privacy
 
-- Per pane ≥ `llm_per_pane_secs` (15 s) between calls; global rolling 60-second window `llm_global_per_min` (6/min); labels cached by fingerprint (LRU 256). Unchanged panes cost nothing (fingerprint = process + cwd + branch + agent state + digit/spinner-normalised screen hash).
+- Per pane ≥ `llm_per_pane_secs` (15 s) between calls; global rolling 60-second window `llm_global_per_min` (6/min); call timestamps shared through a locked state file across sockets, one-shot runs and restarts; labels cached by fingerprint (LRU 256). Unchanged panes cost nothing (fingerprint = process + cwd + branch + agent state + digit/spinner-normalised screen hash).
 - Only the last 40 lines (≤300 chars each) leave the machine, after scrubbing: `key=value` secrets (token/api_key/secret/password/authorization/cookie), `Bearer …`, `sk-…`, `sk-ant-…`, `ghp_…`, `github_pat_…`, `xox?-…`, `AKIA…`, JWTs, private-key headers and any opaque 40+ char run → `[redacted]`. Pure-hex 40-character Git SHAs are preserved unless assigned to a secret key. Process arguments, agent metadata, cwd basename and branch are scrubbed too.
 
 ## Config

@@ -161,6 +161,7 @@ impl Daemon {
         let limiter = RateLimiter::new(
             Duration::from_secs(config.llm_per_pane_secs),
             config.llm_global_per_min,
+            paths.state_dir.join("llm-budget.json"),
         );
         Self {
             client: Client::new(paths.socket.clone()),
@@ -244,7 +245,6 @@ impl Daemon {
         self.applied.retain(|k, _| alive.contains(k));
         self.blocked.retain(|k| alive.contains(k));
         self.cleared.retain(|k| alive.contains(k));
-        self.limiter.retain_panes(&|k| alive.contains(k));
 
         for pane in &snapshot.panes {
             if SHUTDOWN.load(Ordering::Relaxed) {
@@ -360,7 +360,10 @@ impl Daemon {
                 if let Some(cached) = self.cache.get(fp) {
                     (cached, Source::Cache)
                 } else if let Some(provider) = self.provider.clone() {
-                    if !self.limiter.try_acquire(&id) {
+                    if !self
+                        .limiter
+                        .try_acquire(&format!("{}:{id}", self.paths.socket.display()))
+                    {
                         log_debug!("{id}: llm rate-limited; keeping previous label");
                         // Don't record the fingerprint so the next pass retries.
                         if !self.applied.contains_key(&id) {
