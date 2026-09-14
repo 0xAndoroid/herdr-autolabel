@@ -214,6 +214,7 @@ impl Daemon {
                     }
                 }
                 Err(e) => {
+                    connect_failures = 0;
                     self.last_error = Some(e.to_string());
                     log_warn!("pass failed: {e}");
                 }
@@ -246,6 +247,9 @@ impl Daemon {
         self.limiter.retain_panes(&|k| alive.contains(k));
 
         for pane in &snapshot.panes {
+            if SHUTDOWN.load(Ordering::Relaxed) {
+                break;
+            }
             let outcome = self.handle_pane(pane, force, &mut stats)?;
             outcomes.push(outcome);
         }
@@ -297,6 +301,9 @@ impl Daemon {
                 String::new()
             }
         };
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            return Ok(outcome(None, Source::Unchanged, false));
+        }
         let lines: Vec<&str> = screen.lines().collect();
         let fg = heuristics::pick_foreground(&procs);
         let branch = if cwd.is_empty() {
@@ -456,9 +463,12 @@ impl Daemon {
         label: &str,
         stats: &mut PassStats,
     ) -> Result<bool, herdr::Error> {
+        if SHUTDOWN.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
         // An LLM call can outlive a rename or another source's title update.
         let pane = self.client.pane(id)?;
-        if self.skip_pane(&pane, stats)?.is_some() {
+        if self.skip_pane(&pane, stats)?.is_some() || SHUTDOWN.load(Ordering::Relaxed) {
             return Ok(false);
         }
         self.client.set_title(id, label)?;

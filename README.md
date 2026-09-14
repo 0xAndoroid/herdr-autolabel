@@ -55,7 +55,7 @@ herdr-autolabel stop            # SIGTERM the daemon (also: herdr plugin action 
 herdr-autolabel once [--force]  # one pass, prints per-pane labels (relabel action = once --force)
 ```
 
-Add `--socket PATH` to target a named session. Logs: `$HERDR_PLUGIN_STATE_DIR/daemon.log` (`AUTOLABEL_LOG=debug` for verbose); status: `status.json`. The daemon exits by itself after 3 consecutive failed connects (server stopped). Without herdr's env the state dir falls back to `~/.local/state/herdr-autolabel/` and the socket to `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
+Add `--socket PATH` to target a named session. Logs: `$HERDR_PLUGIN_STATE_DIR/daemon.log` (`AUTOLABEL_LOG=debug` for verbose); status: `status.json`. The daemon exits by itself after 3 consecutive failed connects (server stopped). A held per-socket lock prevents duplicate daemons; PID identity is checked before stopping. SIGTERM/INT remove the pidfile after in-flight bounded I/O finishes; SIGKILL can leave a stale file, which is ignored. Without herdr's env the state dir falls back to `~/.local/state/herdr-autolabel/` and the socket to `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.
 
 macOS + Linux.
 

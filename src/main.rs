@@ -12,7 +12,8 @@ mod logging;
 mod ratelimit;
 mod scrub;
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -133,8 +134,64 @@ fn pid_alive(pid: i32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+fn lock_daemon(paths: &Paths) -> std::io::Result<File> {
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(paths.pidfile().with_extension("lock"))?;
+    // SAFETY: the descriptor belongs to the returned file; closing it releases the lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(file)
+}
+
+fn pid_is_daemon(pid: i32) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(args) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+            return false;
+        };
+        let mut args = args.split(|b| *b == 0);
+        let exe = String::from_utf8_lossy(args.next().unwrap_or_default());
+        PathBuf::from(exe.as_ref())
+            .file_name()
+            .is_some_and(|n| n == "herdr-autolabel")
+            && args.next() == Some(b"daemon".as_slice())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let Ok(output) = Command::new("/bin/ps")
+            .args(["-ww", "-p", &pid.to_string(), "-o", "args="])
+            .output()
+        else {
+            return false;
+        };
+        let args = String::from_utf8_lossy(&output.stdout);
+        let Some((exe, rest)) = args.trim().split_once(" daemon") else {
+            return false;
+        };
+        output.status.success()
+            && PathBuf::from(exe)
+                .file_name()
+                .is_some_and(|n| n == "herdr-autolabel")
+            && (rest.is_empty() || rest.starts_with(' '))
+    }
+}
+
 fn running_pid(paths: &Paths) -> Option<i32> {
-    read_pid(paths).filter(|pid| pid_alive(*pid))
+    let pid = read_pid(paths).filter(|pid| pid_is_daemon(*pid))?;
+    // A stale PID alone never establishes ownership of this socket's daemon.
+    match lock_daemon(paths) {
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Some(pid),
+        Err(_) => None,
+    }
 }
 
 fn remove_pidfile(paths: &Paths) {
@@ -173,7 +230,6 @@ fn cmd_start(paths: &Paths) -> i32 {
         eprintln!("cannot create state dir {}: {e}", paths.state_dir.display());
         return 1;
     }
-    remove_pidfile(paths);
     let log_path = paths.log_file();
     // Keep the log bounded.
     if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
@@ -224,13 +280,16 @@ fn cmd_start(paths: &Paths) -> i32 {
             return 1;
         }
     };
-    let pid = child.id();
     drop(child); // Not waited on: it is reparented once we exit.
     // Give the daemon a moment to write its pidfile so the printed status is accurate.
     let deadline = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < deadline && running_pid(paths).is_none() {
         std::thread::sleep(Duration::from_millis(50));
     }
+    let Some(pid) = running_pid(paths) else {
+        eprintln!("daemon did not start; see {}", log_path.display());
+        return 1;
+    };
     logging::log_info!("started daemon pid {pid}, log {}", log_path.display());
     println!("{}", status_json(paths));
     0
@@ -241,22 +300,17 @@ extern "C" fn on_term(_sig: libc::c_int) {
 }
 
 fn cmd_daemon(paths: &Paths) -> i32 {
-    if let Some(pid) = running_pid(paths)
-        && pid != std::process::id() as i32
-    {
-        eprintln!("daemon already running (pid {pid})");
-        return 1;
-    }
     if let Err(e) = std::fs::create_dir_all(&paths.state_dir) {
         eprintln!("cannot create state dir {}: {e}", paths.state_dir.display());
         return 1;
     }
-    if let Err(e) =
-        daemon::write_atomic(&paths.pidfile(), std::process::id().to_string().as_bytes())
-    {
-        eprintln!("cannot write pidfile: {e}");
-        return 1;
-    }
+    let _lock = match lock_daemon(paths) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("cannot acquire daemon lock: {e}");
+            return 1;
+        }
+    };
     // SAFETY: installing a minimal handler that only flips an atomic flag.
     unsafe {
         libc::signal(
@@ -268,6 +322,12 @@ fn cmd_daemon(paths: &Paths) -> i32 {
             on_term as extern "C" fn(libc::c_int) as libc::sighandler_t,
         );
         libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+    if let Err(e) =
+        daemon::write_atomic(&paths.pidfile(), std::process::id().to_string().as_bytes())
+    {
+        eprintln!("cannot write pidfile: {e}");
+        return 1;
     }
     let config = load_config(paths);
     let provider = select_provider(&config);
@@ -286,18 +346,15 @@ fn cmd_stop(paths: &Paths) -> i32 {
                 eprintln!("kill {pid} failed: {}", std::io::Error::last_os_error());
                 return 1;
             }
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while Instant::now() < deadline && pid_alive(pid) {
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < deadline && running_pid(paths) == Some(pid) {
                 std::thread::sleep(Duration::from_millis(50));
             }
-            if !pid_alive(pid) {
-                remove_pidfile(paths);
-            }
-            println!("{}", json!({"stopped": !pid_alive(pid), "pid": pid}));
-            0
+            let stopped = running_pid(paths) != Some(pid);
+            println!("{}", json!({"stopped": stopped, "pid": pid}));
+            i32::from(!stopped)
         }
         None => {
-            remove_pidfile(paths);
             println!("{}", json!({"stopped": false, "reason": "not running"}));
             0
         }
