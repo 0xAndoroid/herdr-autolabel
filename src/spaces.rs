@@ -118,17 +118,25 @@ pub enum Ownership {
     Manual,
 }
 
-/// Classifies a space's current label. `defaults` are the names herdr would have given the
-/// space itself: basenames of pane cwds and of their repositories, and the worktree repo name.
-pub fn classify(current: &str, state: &SpaceState, defaults: &[String]) -> Ownership {
+/// Classifies a space's current label. A space we have never seen is taken over whatever it is
+/// called (the name is remembered and restored on stop); afterwards a name that is neither the
+/// one we applied nor the remembered original was typed by the user. `defaults` are the names
+/// herdr gives spaces itself (basenames of pane cwds and their repositories, the worktree
+/// name): renaming a released space back to one of those hands it back to us.
+pub fn classify(current: &str, state: Option<&SpaceState>, defaults: &[String]) -> Ownership {
+    let Some(state) = state.filter(|s| !s.original.is_empty()) else {
+        return Ownership::Default;
+    };
     if state.applied.as_deref() == Some(current) {
         return Ownership::Ours;
     }
     let current = current.trim();
+    if state.applied.is_none() && state.original == current {
+        return Ownership::Default;
+    }
     if current.is_empty()
         || current.chars().all(|c| c.is_ascii_digit())
         || defaults.iter().any(|d| d == current)
-        || (state.applied.is_none() && state.original == current)
     {
         return Ownership::Default;
     }
@@ -302,27 +310,49 @@ mod tests {
         assert!(defaults.contains(&"pika".to_string()));
         assert!(defaults.contains(&"jolt".to_string()));
         assert!(defaults.contains(&"feat-a".to_string()));
-        let fresh = SpaceState::default();
-        assert_eq!(classify("pika", &fresh, &defaults), Ownership::Default);
-        assert_eq!(classify("3", &fresh, &defaults), Ownership::Default);
-        assert_eq!(classify("", &fresh, &defaults), Ownership::Default);
-        assert_eq!(classify("my project", &fresh, &defaults), Ownership::Manual);
+        // Never seen: taken over whatever the name (herdr's default or a programmatic label).
+        assert_eq!(classify("pika", None, &defaults), Ownership::Default);
+        assert_eq!(classify("my project", None, &defaults), Ownership::Default);
+        let blank = SpaceState::default();
+        assert_eq!(
+            classify("my project", Some(&blank), &[]),
+            Ownership::Default
+        );
         let ours = SpaceState {
             original: "pika".into(),
             applied: Some("fixing tests".into()),
             pending: None,
         };
-        assert_eq!(classify("fixing tests", &ours, &defaults), Ownership::Ours);
+        assert_eq!(
+            classify("fixing tests", Some(&ours), &defaults),
+            Ownership::Ours
+        );
         // Renamed by the user after we labelled it.
-        assert_eq!(classify("my project", &ours, &defaults), Ownership::Manual);
+        assert_eq!(
+            classify("my project", Some(&ours), &defaults),
+            Ownership::Manual
+        );
         // Reset to a default name: ours to take again.
-        assert_eq!(classify("pika", &ours, &defaults), Ownership::Default);
-        // A remembered original counts as default even when no pane is in that dir anymore.
-        let remembered = SpaceState {
+        assert_eq!(classify("pika", Some(&ours), &defaults), Ownership::Default);
+        assert_eq!(classify("3", Some(&ours), &defaults), Ownership::Default);
+        // Released earlier (applied cleared, original kept): stays the user's until it is set
+        // back to the original or a default name.
+        let released = SpaceState {
             original: "old-dir".into(),
             ..Default::default()
         };
-        assert_eq!(classify("old-dir", &remembered, &[]), Ownership::Default);
+        assert_eq!(
+            classify("my project", Some(&released), &[]),
+            Ownership::Manual
+        );
+        assert_eq!(
+            classify("old-dir", Some(&released), &[]),
+            Ownership::Default
+        );
+        assert_eq!(
+            classify("crates", Some(&released), &defaults),
+            Ownership::Default
+        );
     }
 
     #[test]

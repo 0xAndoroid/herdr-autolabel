@@ -557,8 +557,9 @@ impl Daemon {
                 ws.worktree.as_ref().map(|w| w.repo_name.as_str()),
                 ws.worktree.as_ref().map(|w| w.checkout_path.as_str()),
             );
+            let ownership = spaces::classify(&ws.label, states.get(id), &defaults);
             let state = states.entry(id.clone()).or_default();
-            match spaces::classify(&ws.label, state, &defaults) {
+            match ownership {
                 spaces::Ownership::Manual => {
                     if state.applied.take().is_some() {
                         dirty = true;
@@ -1160,8 +1161,8 @@ mod tests {
 
     #[test]
     fn hand_named_spaces_are_never_renamed() {
-        // "my project" is neither a cwd/repo basename nor one of ours → left alone; a space we
-        // named that the user renamed afterwards is released.
+        // w1 was released earlier (the user renamed it away from "pika" and we let go); w2 was
+        // renamed by the user after we named it → released now. Neither is touched.
         let mut replies = vec![(
             "session.snapshot",
             snapshot(
@@ -1176,6 +1177,14 @@ mod tests {
         replies.extend(labelled_pane("w2:p1"));
         let (mut daemon, server) = mock_daemon("manual-spaces", replies);
         let mut states = spaces::SpaceStates::new();
+        states.insert(
+            "w1".into(),
+            spaces::SpaceState {
+                original: "pika".into(),
+                applied: None,
+                pending: None,
+            },
+        );
         states.insert(
             "w2".into(),
             spaces::SpaceState {

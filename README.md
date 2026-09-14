@@ -39,8 +39,8 @@ Manually renamed panes contribute their manual name; panes titled by another sou
 
 **Ownership:** herdr has no display-only title for workspaces (only custom `$tokens`, which need a sidebar layout change), so spaces are renamed with `workspace.rename` — the same name `herdr workspace rename` sets — under these rules:
 
-- A space is only renamed while it carries herdr's own default name (the cwd/repo basename of one of its panes, the worktree name, a number) or a name we set. Anything else is a name you typed: never touched.
-- If you rename a space we named, we let go of it immediately and never rename it again (until it is set back to a default name).
+- A space we have never seen is taken over whatever it is called — herdr's default (cwd basename), a programmatic label such as the `pika` workspaces the Pika TUI opens — and its name is remembered.
+- If you rename a space we named, we let go of it immediately and never rename it again until it is set back to the remembered name or to a herdr default (the cwd/repo basename of one of its panes, the worktree name, a number).
 - The pre-rename name is remembered in `spaces-<socket hash>.json` in the state dir, so a restarted daemon still recognises its own names; `stop` (SIGTERM, the `stop` action) puts every original name back. The space then shows herdr's default again. Only spaces still carrying one of our names are restored.
 - Before writing, the space is re-read (`workspace.get`); a rename racing the pass skips that pass.
 
@@ -93,7 +93,7 @@ macOS + Linux.
 
 - A competing metadata title from another source makes the daemon skip that pane for as long as the title is present; once it disappears the pane is labelled again. Our own titles from a previous daemon run look the same (the snapshot does not expose title ownership): they are cleared once, then relabelled on the next pass. Before writing, we recheck the pane; herdr has no atomic compare-and-set, so a rename racing that final write is cleared on the next pass.
 - Space names are real workspace labels, not metadata: without the state file (deleted, or a different `HERDR_PLUGIN_STATE_DIR`) a name we set looks like one you typed and is left alone; `herdr workspace rename <id> <cwd basename>` hands it back. Pane titles are not restored on stop (they are metadata and cleared on the next run).
-- A space is first classified by the names its current panes could have given it; a space created in a directory none of its panes is in anymore looks hand-named until it is renamed to a default.
+- Names typed before the daemon first saw a space are not distinguishable from herdr's defaults: they are replaced while the daemon runs and put back on `stop`. Rename the space again (while the daemon runs) to keep your name.
 - Heuristics look at the first non-shell foreground process; pipelines label by their first command.
 - Coding-agent panes are always LLM-labelled (cached per fingerprint); with `provider = "none"` they fall back to `<agent> <branch|cwd>`.
 - Labels reflect the last 40 lines; a long-idle agent keeps its last label until the screen changes.
