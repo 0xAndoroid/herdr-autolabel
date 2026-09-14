@@ -245,6 +245,8 @@ fn read_frame(stream: &mut UnixStream, timeout: Duration) -> Result<Vec<u8>, Err
         if remaining.is_zero() {
             return Err(Error::Io(std::io::ErrorKind::TimedOut.into()));
         }
+        // Darwin rejects timeval values whose rounded microsecond field reaches 1,000,000.
+        let remaining = Duration::from_micros(remaining.as_micros().max(1) as u64);
         stream
             .set_read_timeout(Some(remaining))
             .map_err(Error::Io)?;
