@@ -10,7 +10,10 @@ pub fn finalize(raw: &str, max_words: usize, max_chars: usize) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let mut words: Vec<&str> = cleaned.split_whitespace().collect();
-    words.truncate(max_words);
+    if words.len() > max_words {
+        words.truncate(max_words);
+        drop_dangling(&mut words);
+    }
     let joined = words.join(" ");
     let trimmed = joined.trim_end_matches(|c: char| {
         matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '…' | '-' | '—')
@@ -18,19 +21,41 @@ pub fn finalize(raw: &str, max_words: usize, max_chars: usize) -> String {
     truncate_words(trimmed.trim(), max_chars)
 }
 
-/// Truncates to at most `max_chars` characters, preferring a word boundary.
+/// Words that say nothing at the end of a cut label ("keccak spec to").
+const DANGLING: &[&str] = &[
+    "a", "an", "and", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to",
+    "via", "with",
+];
+
+/// Drops trailing connectives left behind by a cut; a single word is kept whatever it is.
+fn drop_dangling(words: &mut Vec<&str>) {
+    while words.len() > 1
+        && words
+            .last()
+            .is_some_and(|w| DANGLING.contains(&w.to_ascii_lowercase().as_str()))
+    {
+        words.pop();
+    }
+}
+
+/// Truncates to at most `max_chars` characters, preferring a word boundary; a label cut at a
+/// word boundary never ends in a connective.
 pub fn truncate_words(s: &str, max_chars: usize) -> String {
     if s.chars().count() <= max_chars {
         return s.to_string();
     }
     let hard: String = s.chars().take(max_chars).collect();
-    if s.chars().nth(max_chars).is_some_and(char::is_whitespace) {
-        return hard.trim_end().to_string();
-    }
-    match hard.rfind(' ') {
-        Some(idx) if idx > 0 => hard[..idx].trim_end().to_string(),
-        _ => hard.trim_end().to_string(),
-    }
+    let cut = if s.chars().nth(max_chars).is_some_and(char::is_whitespace) {
+        hard.trim_end()
+    } else {
+        match hard.rfind(' ') {
+            Some(idx) if idx > 0 => hard[..idx].trim_end(),
+            _ => return hard.trim_end().to_string(),
+        }
+    };
+    let mut words: Vec<&str> = cut.split_whitespace().collect();
+    drop_dangling(&mut words);
+    words.join(" ")
 }
 
 #[cfg(test)]
@@ -45,7 +70,7 @@ mod tests {
         let out = finalize("Reviewing PR 1283 for the auth refactor", 10, 24);
         assert!(out.chars().count() <= 24);
         assert!(!out.ends_with(' '));
-        assert_eq!(out, "Reviewing PR 1283 for");
+        assert_eq!(out, "Reviewing PR 1283");
     }
 
     #[test]
@@ -76,6 +101,18 @@ mod tests {
         assert_eq!(truncate_words("cargo build more", 11), "cargo build");
         assert_eq!(truncate_words("nvim extraordinarily-long.rs", 24), "nvim");
         assert_eq!(truncate_words("界界 abcdefghijkl", 6), "界界");
+    }
+
+    #[test]
+    fn cut_labels_drop_dangling_connectives() {
+        assert_eq!(truncate_words("keccak spec to Pika", 16), "keccak spec");
+        // The word cap leaves the same debris.
+        assert_eq!(finalize("keccak spec to Pika", 3, 22), "keccak spec");
+        assert_eq!(finalize("waiting for CI", 3, 22), "waiting for CI");
+        assert_eq!(truncate_words("handoff to the new API", 17), "handoff");
+        // Only a cut is cleaned up; a label that fits keeps its words.
+        assert_eq!(truncate_words("waiting for", 22), "waiting for");
+        assert_eq!(truncate_words("to somewhere else", 4), "to");
     }
 
     #[test]

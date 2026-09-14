@@ -28,7 +28,7 @@ impl Default for Config {
             interval_secs: 10,
             provider: "auto".into(),
             model: None,
-            max_chars: 24,
+            max_chars: 25,
             lines: 40,
             llm_per_pane_secs: 15,
             llm_global_per_min: 6,
@@ -151,7 +151,7 @@ mod tests {
         assert_eq!(c.interval_secs, 10);
         assert_eq!(c.provider, "auto");
         assert_eq!(c.model, None);
-        assert_eq!(c.max_chars, 24);
+        assert_eq!(c.max_chars, 25);
         assert_eq!(c.lines, 40);
         assert_eq!(c.llm_per_pane_secs, 15);
         assert_eq!(c.llm_global_per_min, 6);
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(c.interval_secs, 30);
         assert_eq!(c.provider, "anthropic");
         assert_eq!(c.deny, vec!["w9*".to_string()]);
-        assert_eq!(c.max_chars, 24);
+        assert_eq!(c.max_chars, 25);
     }
 
     #[test]
@@ -186,7 +186,7 @@ mod tests {
     fn invalid_fields_preserve_valid_settings() {
         let c = Config::parse("provider = \"none\"\nmax_chars = \"bad\"\ninterval_secs = 0\nllm_per_pane_secs = 0\nllm_global_per_min = 100").unwrap();
         assert_eq!(c.provider, "none");
-        assert_eq!(c.max_chars, 24);
+        assert_eq!(c.max_chars, 25);
         assert_eq!(c.interval_secs, 10);
         assert_eq!(c.llm_per_pane_secs, 15);
         assert_eq!(c.llm_global_per_min, 6);

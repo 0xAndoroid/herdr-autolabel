@@ -67,6 +67,7 @@ pub struct PaneInfo {
     pub title: Option<String>,
     pub agent: Option<String>,
     pub agent_status: Option<String>,
+    pub agent_session: Option<AgentSession>,
     pub display_agent: Option<String>,
     pub terminal_title: Option<String>,
     pub terminal_title_stripped: Option<String>,
@@ -74,6 +75,17 @@ pub struct PaneInfo {
     pub focused: bool,
     pub tokens: HashMap<String, String>,
     pub state_labels: HashMap<String, String>,
+}
+
+/// The agent's own session identity as reported to herdr (`herdr pane report-agent-session`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct AgentSession {
+    pub agent: String,
+    /// `id` (a session id to look up under the agent's session directory) or `path` (the
+    /// transcript file itself).
+    pub kind: String,
+    pub value: String,
 }
 
 impl PaneInfo {
@@ -257,12 +269,12 @@ impl Client {
         )
     }
 
-    pub fn read_recent(&self, pane_id: &str, lines: u32) -> Result<ReadResult, Error> {
+    pub fn read_visible(&self, pane_id: &str, lines: u32) -> Result<ReadResult, Error> {
         self.call_payload(
             "pane.read",
             json!({
                 "pane_id": pane_id,
-                "source": "recent_unwrapped",
+                "source": "visible",
                 "lines": lines,
                 "format": "text",
                 "strip_ansi": true,
@@ -463,12 +475,15 @@ mod tests {
         let s = sock("typed");
         serve_once(s.clone(), |req| {
             assert_eq!(req["method"], "pane.read");
-            assert_eq!(req["params"]["source"], "recent_unwrapped");
+            assert_eq!(req["params"]["source"], "visible");
             assert_eq!(req["params"]["lines"], 40);
             json!({"id": req["id"], "result": {"type": "pane_read", "read": {"text": "ready"}}})
                 .to_string()
         });
-        assert_eq!(Client::new(&s).read_recent("p1", 40).unwrap().text, "ready");
+        assert_eq!(
+            Client::new(&s).read_visible("p1", 40).unwrap().text,
+            "ready"
+        );
         std::fs::remove_file(&s).unwrap();
         serve_once(s.clone(), |req| {
             assert_eq!(

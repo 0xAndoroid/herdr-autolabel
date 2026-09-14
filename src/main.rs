@@ -12,6 +12,7 @@ mod logging;
 mod ratelimit;
 mod scrub;
 mod spaces;
+mod transcript;
 
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;

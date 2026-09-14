@@ -14,8 +14,8 @@ provider = "auto"
 #   openai    = "gpt-5-mini"
 # model = "qwen-3.8-27b"
 
-# Hard cap on label length (characters).
-max_chars = 24
+# Hard cap on label length (characters): pane titles, and space names as a whole.
+max_chars = 25
 
 # Lines of recent pane output inspected (and sent, scrubbed, to the LLM).
 lines = 40

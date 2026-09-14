@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::label;
 use crate::scrub;
 
-pub const SYSTEM_PROMPT: &str = "You label terminal panes. Reply with ONLY a 1–2 word label (max 3 words, ≤24 chars) describing what the user is doing in this pane right now. Prefer concrete nouns: PR numbers (e.g. 'review PR 1283'), branch names (e.g. 'feat/moving-button'), file names, commands. No quotes, no punctuation at the end, no explanations.";
+pub const SYSTEM_PROMPT: &str = "You name terminal panes for a sidebar. Reply with ONLY the name: at most the number of characters given, no quotes, no trailing punctuation, no explanation. Shape: '<project>: <task>'. <project> is a short form of the project name ('herdr' for herdr-autolabel); a repository name always stays, leave it out only for a home or scratch folder (dev, Downloads, dotfiles). <task> is a 1–3 word phrase. When a 'user's request' line is present (the user's last prompt to a coding agent, or the agent's summary of it), <task> MUST paraphrase that request and nothing else: not the file the agent has open, not the command it is running right now. Otherwise name what is being done, preferring concrete nouns: PR numbers ('review PR 1283'), branch names, file names, commands.";
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_TOKENS: u32 = 40;
@@ -163,15 +163,25 @@ pub struct Context<'a> {
     pub agent: Option<&'a str>,
     pub agent_status: Option<&'a str>,
     pub process: Option<&'a str>,
+    /// Repository checkout name without a worktree suffix; the model shortens or omits it.
+    pub project: Option<&'a str>,
     pub cwd_basename: &'a str,
     pub branch: Option<&'a str>,
+    /// What the user asked the agent for — the last prompt from Claude's transcript, else the
+    /// summary coding agents keep in the terminal title; heads the prompt as the request the
+    /// task must paraphrase.
+    pub request: Option<&'a str>,
     pub lines: &'a [&'a str],
 }
 
-/// Builds the user message: facts block, PR mentions, then the scrubbed screen.
-pub fn user_message(ctx: &Context) -> String {
+/// Builds the user message: facts block, the name budget, PR mentions, then the scrubbed
+/// screen.
+pub fn user_message(ctx: &Context, max_chars: usize) -> String {
     let clean = |value: &str| scrub::scrub_line(&value.replace(['\n', '\r'], " "));
     let mut out = String::new();
+    if let Some(r) = ctx.request {
+        out.push_str(&format!("user's request: {}\n", clean(r)));
+    }
     if let Some(a) = ctx.agent {
         out.push_str(&format!("agent: {}", clean(a)));
         if let Some(s) = ctx.agent_status {
@@ -180,12 +190,21 @@ pub fn user_message(ctx: &Context) -> String {
         out.push('\n');
     }
     if let Some(p) = ctx.process {
-        out.push_str(&format!("foreground process: {}\n", clean(p)));
+        let what = if ctx.agent.is_some() {
+            "command the agent is running"
+        } else {
+            "foreground process"
+        };
+        out.push_str(&format!("{what}: {}\n", clean(p)));
+    }
+    if let Some(p) = ctx.project {
+        out.push_str(&format!("project: {}\n", clean(p)));
     }
     out.push_str(&format!("cwd: {}\n", clean(ctx.cwd_basename)));
     if let Some(b) = ctx.branch {
         out.push_str(&format!("git branch: {}\n", clean(b)));
     }
+    out.push_str(&format!("name budget: {max_chars} characters\n"));
     let scrubbed = scrub::scrub_lines(ctx.lines.iter().copied());
     let prs = pr_mentions(&scrubbed);
     if !prs.is_empty() {
@@ -327,7 +346,7 @@ impl Provider {
 
     /// Full pipeline: prompt → completion → cleaned label (empty string when unusable).
     pub fn label(&self, ctx: &Context, max_chars: usize) -> Result<String, Error> {
-        let raw = self.complete(&user_message(ctx))?;
+        let raw = self.complete(&user_message(ctx, max_chars))?;
         let cleaned = postprocess(&raw, max_chars);
         if cleaned.is_empty() {
             return Err(Error::Empty);
@@ -336,7 +355,8 @@ impl Provider {
     }
 }
 
-/// Strips quotes/backticks/trailing punctuation, collapses whitespace, ≤3 words, ≤`max_chars`.
+/// Strips quotes/backticks/trailing punctuation, collapses whitespace, ≤5 words (`project:` +
+/// a 1–3 word task), ≤`max_chars`.
 pub fn postprocess(raw: &str, max_chars: usize) -> String {
     let raw = raw.trim();
     // Some models prefix "Label:" or wrap in a sentence; keep the last line that has content.
@@ -349,7 +369,7 @@ pub fn postprocess(raw: &str, max_chars: usize) -> String {
         .strip_prefix("Label:")
         .or_else(|| candidate.strip_prefix("label:"))
         .unwrap_or(candidate);
-    label::finalize(candidate, 3, max_chars)
+    label::finalize(candidate, 5, max_chars)
 }
 
 #[cfg(test)]
@@ -380,8 +400,8 @@ mod tests {
             "feat/moving-button"
         );
         assert_eq!(
-            postprocess("Label: fixing auth tests now", 24),
-            "fixing auth tests"
+            postprocess("Label: herdr: fixing auth tests now", 25),
+            "herdr: fixing auth tests"
         );
         assert_eq!(
             postprocess("Reviewing PR 1283 for the auth refactor", 24),
@@ -407,14 +427,22 @@ mod tests {
             agent: Some("claude"),
             agent_status: Some("working"),
             process: None,
+            project: Some("jolt"),
             cwd_basename: "pika",
             branch: Some("main"),
+            request: Some("Review PR"),
             lines: &lines,
         };
-        let msg = user_message(&ctx);
+        let msg = user_message(&ctx, 25);
         assert!(msg.contains("agent: claude (working)"));
-        assert!(msg.contains("cwd: pika"));
-        assert!(msg.contains("git branch: main"));
+        assert!(msg.starts_with("user's request: Review PR\nagent: claude"));
+        assert!(
+            msg.contains(
+                "project: jolt\ncwd: pika\ngit branch: main\nname budget: 25 characters\n"
+            )
+        );
+        let bare = user_message(&Context::default(), 25);
+        assert!(!bare.contains("project:") && !bare.contains("user's request:"));
         assert!(msg.contains("PRs mentioned: PR 1283, PR 77"));
         assert!(!msg.contains("sk-abcdefghijkl"));
         assert!(msg.contains("OPENAI_API_KEY=[redacted]"));
@@ -426,11 +454,13 @@ mod tests {
             agent: Some("password=hunter2"),
             agent_status: Some("token=hunter2"),
             process: Some("worker password='hunter2'"),
+            project: Some("password=hunter2"),
             cwd_basename: "secret=hunter2",
             branch: Some("api_key=hunter2"),
+            request: Some("Bearer hunter2hunter2"),
             lines: &["safe"],
         };
-        assert!(!user_message(&ctx).contains("hunter2"));
+        assert!(!user_message(&ctx, 25).contains("hunter2"));
     }
 
     #[test]

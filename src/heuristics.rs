@@ -45,9 +45,15 @@ pub struct PaneFacts {
 pub enum Decision {
     /// Deterministic label; no LLM needed.
     Label(String),
+    /// Deterministic and already a whole name: spaces use it as it is, without a project.
+    Whole(String),
     /// Ask the LLM; use `fallback` when it fails or is unavailable.
     Llm { fallback: String },
 }
+
+/// Assistant TUIs whose conversations are not this pane's work: the pane and its space are
+/// named after the agent itself.
+const NAMED_AGENTS: &[&str] = &["pika"];
 
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh", "csh", "ash", "elvish", "xonsh",
@@ -217,22 +223,25 @@ fn is_default_branch(branch: &str) -> bool {
     matches!(branch, "main" | "master" | "trunk" | "develop")
 }
 
-/// What groups panes of one space together: the non-default branch, else the repository
-/// checkout name, else the cwd basename. `None` without a cwd.
-pub fn scope(facts: &PaneFacts) -> Option<String> {
-    if let Some(b) = facts
-        .branch
-        .as_deref()
-        .filter(|b| !b.is_empty() && !is_default_branch(b))
-    {
-        return Some(b.to_string());
-    }
-    let cwd = facts.cwd.trim_end_matches('/');
+/// Worktree checkouts are named `<repo>.<branch>` (worktrunk's default template), so the
+/// project is the part before the first dot; a leading dot (`.dotfiles`) belongs to the name.
+pub fn project_name(dir: &str) -> &str {
+    dir.char_indices()
+        .skip(1)
+        .find(|&(_, c)| c == '.')
+        .map_or(dir, |(i, _)| &dir[..i])
+}
+
+/// Where a pane's work happens: the repository checkout name, else the cwd basename, without
+/// a worktree suffix. `None` without a cwd.
+pub fn project(cwd: &str) -> Option<String> {
+    let cwd = cwd.trim_end_matches('/');
     if cwd.is_empty() {
         return None;
     }
     crate::git::repo_basename(Path::new(cwd))
         .or_else(|| Some(basename(cwd)))
+        .map(|d| project_name(&d).to_string())
         .filter(|s| !s.is_empty())
 }
 
@@ -244,7 +253,7 @@ fn idle_label(facts: &PaneFacts) -> String {
             if base.is_empty() {
                 "shell".into()
             } else {
-                base
+                project_name(&base).to_string()
             }
         }
     }
@@ -477,6 +486,9 @@ pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
         .or_else(|| facts.fg.as_ref().and_then(agent_of));
 
     if let Some(agent) = agent_kind {
+        if NAMED_AGENTS.contains(&agent.as_str()) {
+            return Decision::Whole(fin(&agent));
+        }
         let fallback = fin(&format!("{agent} {}", idle_label(facts)));
         return Decision::Llm { fallback };
     }
@@ -514,11 +526,23 @@ mod tests {
 
     fn label_of(argv: &[&str], cwd: &str, branch: Option<&str>) -> String {
         match decide(&facts(argv, cwd, branch), 24) {
-            Decision::Label(l) => l,
+            Decision::Label(l) | Decision::Whole(l) => l,
             Decision::Llm { fallback } => {
                 panic!("expected heuristic label, got LLM (fallback {fallback})")
             }
         }
+    }
+
+    #[test]
+    fn project_drops_worktree_suffix_and_keeps_leading_dot() {
+        assert_eq!(project_name("jolt.keccak-xorrotl-fusion"), "jolt");
+        assert_eq!(project_name(".dotfiles"), ".dotfiles");
+        assert_eq!(project_name(".dotfiles.wip"), ".dotfiles");
+        assert_eq!(project_name("herdr-autolabel"), "herdr-autolabel");
+        assert_eq!(project("/x/jolt.keccak/").as_deref(), Some("jolt"));
+        assert_eq!(project(""), None);
+        assert_eq!(label_of(&["zsh"], "/x/jolt.keccak", Some("main")), "jolt");
+        assert_eq!(label_of(&["zsh"], "/x/.dotfiles", None), ".dotfiles");
     }
 
     #[test]
@@ -673,6 +697,9 @@ mod tests {
                 fallback: "codex pika".into()
             }
         );
+        // The Pika assistant is named after itself, no LLM.
+        f.agent = Some("pika".into());
+        assert_eq!(decide(&f, 24), Decision::Whole("pika".into()));
         // node running the claude bundle.
         let f = facts(
             &[

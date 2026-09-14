@@ -18,52 +18,77 @@ pub struct PaneSummary {
     pub label: String,
     /// A coding agent (claude/codex/pika/…) runs in the pane.
     pub agent: bool,
-    pub focused: bool,
-    /// Branch when on a non-default branch, else the repo/cwd basename.
-    pub scope: Option<String>,
+    /// A command runs in the pane, or someone named it: the label says what is done, not only
+    /// where.
+    pub busy: bool,
+    /// The label is a whole space name already (LLM-written, project included as far as it
+    /// helps); no project is put in front of it.
+    pub whole: bool,
+    /// Repository checkout name, else cwd basename.
+    pub project: Option<String>,
 }
 
-/// Derives the space label from its panes:
-/// 1. one pane → that pane's label verbatim;
-/// 2. an agent pane → that pane's label (the focused agent pane when several);
-/// 3. else the scope (branch, else repo/cwd) shared by most panes, when at least two share it;
-/// 4. else the focused pane's label, else the first labelled pane's.
-pub fn aggregate(panes: &[PaneSummary], max_chars: usize) -> Option<String> {
+/// Derives the space label from the primary pane — the first agent pane, else the first busy
+/// pane, else the first labelled pane; focus plays no part, so switching panes never renames
+/// the space — within `max_chars` in total:
+/// - a whole label (LLM-written) is used as is;
+/// - otherwise `<project>: <activity>`, the project being `worktree` (herdr's repository name
+///   for a worktree space) when set, else the project named by most panes (ties go to the
+///   first pane), and the activity the primary pane's label cut to whole words in the room
+///   the project leaves.
+///
+/// The project alone when the activity repeats it (idle shells at the repository root) or when
+/// not even its first word fits; the activity alone when no pane has a cwd.
+pub fn aggregate(
+    panes: &[PaneSummary],
+    worktree: Option<&str>,
+    max_chars: usize,
+) -> Option<String> {
     let labelled: Vec<&PaneSummary> = panes.iter().filter(|p| !p.label.is_empty()).collect();
-    let pick = |s: &str| Some(label::truncate_words(s, max_chars)).filter(|l| !l.is_empty());
-    match labelled.as_slice() {
-        [] => return None,
-        [only] => return pick(&only.label),
-        _ => {}
-    }
-    if let Some(agent) = labelled
+    let primary = labelled
         .iter()
-        .find(|p| p.agent && p.focused)
-        .or_else(|| labelled.iter().find(|p| p.agent))
-    {
-        return pick(&agent.label);
+        .find(|p| p.agent)
+        .or_else(|| labelled.iter().find(|p| p.busy))
+        .or(labelled.first())?;
+    if primary.whole {
+        return Some(label::truncate_words(&primary.label, max_chars));
     }
-    // Dominant scope: highest count wins, first occurrence breaks ties.
+    let project = worktree
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .or_else(|| dominant_project(&labelled));
+    let Some(project) = project else {
+        return Some(label::truncate_words(&primary.label, max_chars));
+    };
+    let room = max_chars.saturating_sub(project.chars().count() + 2);
+    let first_word_fits = primary
+        .label
+        .split_whitespace()
+        .next()
+        .is_some_and(|w| w.chars().count() <= room);
+    let activity = label::truncate_words(&primary.label, room);
+    Some(if !first_word_fits || activity == project {
+        label::truncate_words(&project, max_chars)
+    } else {
+        format!("{project}: {activity}")
+    })
+}
+
+/// The project named by most panes; ties go to the first pane seen.
+fn dominant_project(panes: &[&PaneSummary]) -> Option<String> {
     let mut counts: Vec<(&str, usize)> = Vec::new();
-    for scope in labelled.iter().filter_map(|p| p.scope.as_deref()) {
-        match counts.iter_mut().find(|(s, _)| *s == scope) {
+    for project in panes.iter().filter_map(|p| p.project.as_deref()) {
+        match counts.iter_mut().find(|(s, _)| *s == project) {
             Some((_, n)) => *n += 1,
-            None => counts.push((scope, 1)),
+            None => counts.push((project, 1)),
         }
     }
-    let mut best: Option<(&str, usize)> = None;
-    for (scope, n) in &counts {
-        if best.is_none_or(|(_, m)| *n > m) {
-            best = Some((scope, *n));
-        }
-    }
-    if let Some((scope, n)) = best
-        && n >= 2
-    {
-        return pick(scope);
-    }
-    let focused = labelled.iter().find(|p| p.focused).unwrap_or(&labelled[0]);
-    pick(&focused.label)
+    // `max_by_key` keeps the last maximum; reversed, that is the first project seen.
+    counts
+        .iter()
+        .rev()
+        .max_by_key(|(_, n)| *n)
+        .map(|(p, _)| p.to_string())
 }
 
 /// Per-space state, persisted so a restarted daemon still recognises its own names.
@@ -190,86 +215,155 @@ pub fn save_states(path: &Path, states: &SpaceStates) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
-    fn pane(label: &str, agent: bool, focused: bool, scope: Option<&str>) -> PaneSummary {
+    fn pane(label: &str, agent: bool, busy: bool, project: Option<&str>) -> PaneSummary {
         PaneSummary {
             label: label.into(),
             agent,
-            focused,
-            scope: scope.map(str::to_string),
+            busy,
+            whole: false,
+            project: project.map(str::to_string),
         }
     }
 
     #[test]
-    fn single_pane_space_takes_the_pane_label_verbatim() {
-        let panes = [pane("cargo build", false, false, Some("jolt"))];
-        assert_eq!(aggregate(&panes, 24).as_deref(), Some("cargo build"));
-        assert_eq!(aggregate(&[], 24), None);
-        assert_eq!(aggregate(&[pane("", false, true, None)], 24), None);
-    }
-
-    #[test]
-    fn agent_pane_wins_over_everything() {
+    fn whole_labels_are_used_as_they_are() {
         let panes = [
-            pane("feat/x", false, true, Some("feat/x")),
-            pane("nvim foo.rs", false, false, Some("feat/x")),
-            pane("fixing auth tests", true, false, Some("feat/x")),
-        ];
-        assert_eq!(aggregate(&panes, 24).as_deref(), Some("fixing auth tests"));
-        // Several agents: the focused one.
-        let panes = [
-            pane("codex reviewing", true, false, None),
-            pane("claude writing docs", true, true, None),
+            pane("nvim foo.rs", false, true, Some("herdr-autolabel")),
+            PaneSummary {
+                whole: true,
+                ..pane(
+                    "herdr: fix label rules",
+                    true,
+                    true,
+                    Some("herdr-autolabel"),
+                )
+            },
         ];
         assert_eq!(
-            aggregate(&panes, 24).as_deref(),
-            Some("claude writing docs")
+            aggregate(&panes, Some("herdr-autolabel"), 25).as_deref(),
+            Some("herdr: fix label rules")
+        );
+        let panes = [PaneSummary {
+            whole: true,
+            ..pane("relocate worktrees to wt", true, true, Some("dev"))
+        }];
+        assert_eq!(
+            aggregate(&panes, None, 25).as_deref(),
+            Some("relocate worktrees to wt")
         );
     }
 
     #[test]
-    fn dominant_scope_across_panes() {
-        let panes = [
-            pane("cargo test", false, false, Some("feat/moving-button")),
-            pane("nvim app.rs", false, true, Some("feat/moving-button")),
-            pane("htop", false, false, Some("pika")),
-        ];
-        assert_eq!(aggregate(&panes, 24).as_deref(), Some("feat/moving-button"));
-        // Ties resolve to the first scope seen.
-        let panes = [
-            pane("a", false, false, Some("pika")),
-            pane("b", false, true, Some("pika")),
-            pane("c", false, false, Some("jolt")),
-            pane("d", false, false, Some("jolt")),
-        ];
-        assert_eq!(aggregate(&panes, 24).as_deref(), Some("pika"));
+    fn project_then_activity() {
+        let panes = [pane("cargo build", false, true, Some("jolt"))];
+        assert_eq!(
+            aggregate(&panes, None, 24).as_deref(),
+            Some("jolt: cargo build")
+        );
+        // The activity alone without a cwd; the project alone when the activity repeats it.
+        let panes = [pane("ssh mini", false, true, None)];
+        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("ssh mini"));
+        let panes = [pane("pika", false, false, Some("pika"))];
+        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("pika"));
+        assert_eq!(aggregate(&[], None, 24), None);
+        assert_eq!(
+            aggregate(&[pane("", false, true, Some("pika"))], None, 24),
+            None
+        );
     }
 
     #[test]
-    fn falls_back_to_focused_then_first_pane() {
-        let panes = [
-            pane("cargo test", false, false, Some("jolt")),
-            pane("ssh mini", false, true, None),
-            pane("htop", false, false, Some("pika")),
-        ];
-        assert_eq!(aggregate(&panes, 24).as_deref(), Some("ssh mini"));
-        let panes = [
-            pane("cargo test", false, false, Some("jolt")),
-            pane("htop", false, false, Some("pika")),
-        ];
-        assert_eq!(aggregate(&panes, 24).as_deref(), Some("cargo test"));
+    fn worktree_names_the_project() {
+        let panes = [pane("cargo test", false, true, Some("feat-a"))];
+        assert_eq!(
+            aggregate(&panes, Some("jolt"), 24).as_deref(),
+            Some("jolt: cargo test")
+        );
+        assert_eq!(
+            aggregate(&panes, Some(""), 24).as_deref(),
+            Some("feat-a: cargo test")
+        );
     }
 
     #[test]
-    fn labels_are_capped_at_max_chars() {
+    fn first_agent_pane_sets_the_activity() {
+        let panes = [
+            pane("feat/x", false, false, Some("pika")),
+            pane("nvim foo.rs", false, true, Some("pika")),
+            pane("fixing auth tests", true, true, Some("pika")),
+        ];
+        assert_eq!(
+            aggregate(&panes, None, 24).as_deref(),
+            Some("pika: fixing auth tests")
+        );
+        // Several agents: the first one, whatever is focused.
+        let panes = [
+            pane("wt switch", true, true, Some("pika")),
+            pane("watching CI run", true, true, Some("pika")),
+        ];
+        assert_eq!(
+            aggregate(&panes, None, 24).as_deref(),
+            Some("pika: wt switch")
+        );
+    }
+
+    #[test]
+    fn dominant_project_then_busy_pane_then_first() {
+        let panes = [
+            pane("crates", false, false, Some("pika")),
+            pane("htop", false, true, Some("jolt")),
+            pane("cargo test", false, true, Some("pika")),
+        ];
+        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("pika: htop"));
+        // Ties resolve to the first project seen; idle shells fall back to the first label.
+        let panes = [
+            pane("sub", false, false, Some("jolt")),
+            pane("crates", false, false, Some("pika")),
+        ];
+        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("jolt: sub"));
+    }
+
+    #[test]
+    fn whole_label_is_capped_at_max_chars() {
+        let panes = [pane("delegating keccak PR review", true, true, Some("shop"))];
+        assert_eq!(
+            aggregate(&panes, None, 22).as_deref(),
+            Some("shop: delegating keccak")
+        );
+        // A project that leaves no room for the activity's first word stands alone.
         let panes = [pane(
-            "extraordinarily long agent label here",
+            "cargo build",
+            false,
             true,
+            Some("herdr-autolabel-plugin"),
+        )];
+        assert_eq!(
+            aggregate(&panes, None, 22).as_deref(),
+            Some("herdr-autolabel-plugin")
+        );
+        let panes = [pane("cargo build", false, true, Some("herdr-autolabel"))];
+        assert_eq!(
+            aggregate(&panes, None, 22).as_deref(),
+            Some("herdr-autolabel: cargo")
+        );
+        let panes = [pane(
+            "x",
+            false,
+            true,
+            Some("a-project-name-past-the-cap-x"),
+        )];
+        let out = aggregate(&panes, None, 22).unwrap();
+        assert!(out.chars().count() <= 22, "{out}");
+        let panes = [pane(
+            "a long label without a cwd anywhere",
+            false,
             true,
             None,
         )];
-        let out = aggregate(&panes, 24).unwrap();
-        assert!(out.chars().count() <= 24, "{out}");
-        assert_eq!(out, "extraordinarily long");
+        assert_eq!(
+            aggregate(&panes, None, 22).as_deref(),
+            Some("a long label without")
+        );
     }
 
     #[test]
