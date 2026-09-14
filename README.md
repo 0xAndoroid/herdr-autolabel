@@ -17,6 +17,7 @@ The `[[startup]]` hook runs on every herdr server start (and live handoff) and s
 - **Idle shell** → git branch if the cwd is in a repo (read from `.git/HEAD`, no subprocess) and the branch is not a default one (`main`/`master`/`trunk`/`develop`), else cwd basename.
 - **Known process** (cargo, git, npm/pnpm/yarn/bun, make, just, pytest, go, python, node, editors, ssh, htop, less, man, tail, docker, kubectl, gh, …) → deterministic `<tool> <subcommand|file|host>`, no LLM.
 - **Agent panes** (claude, codex, pi, gemini, cursor, opencode, …) **and unknown long-running processes** → LLM over the scrubbed last 40 lines + cwd/branch/PR mentions; on failure or `provider = "none"` → `<agent> <branch|cwd>` / `<cmd> <arg>`.
+- Cerebras qwen occasionally returns an empty completion under `reasoning_effort: none`; the call is retried once with `low` reasoning (~50–80 completion tokens) before falling back.
 
 Manual renames always win: a pane with a `herdr pane rename` label is never titled, and any title we set on it is cleared.
 
@@ -52,7 +53,7 @@ Globs match the entire pane ID, workspace ID or cwd. `*` includes `/`; `?` match
 ```sh
 herdr-autolabel status          # JSON: running, pid, provider/model, last pass stats
 herdr-autolabel stop            # SIGTERM the daemon (also: herdr plugin action invoke andoroid.autolabel.stop)
-herdr-autolabel once [--force]  # one pass, prints per-pane labels (relabel action = once --force)
+herdr-autolabel once [--force]  # one pass, prints per-pane labels (relabel action = once --force)  # note: a one-shot run from a second process treats the daemon's titles as foreign, clears and relabels them; the daemon re-applies within one interval
 ```
 
 Add `--socket PATH` to target a named session. Logs: `$HERDR_PLUGIN_STATE_DIR/daemon.log` (`AUTOLABEL_LOG=debug` for verbose); status: `status.json`. The daemon exits by itself after 3 consecutive failed connects (server stopped). A held per-socket lock prevents duplicate daemons; PID identity is checked before stopping. SIGTERM/INT remove the pidfile after in-flight bounded I/O finishes; SIGKILL can leave a stale file, which is ignored. Without herdr's env the state dir falls back to `~/.local/state/herdr-autolabel/` and the socket to `HERDR_SOCKET_PATH` or `~/.config/herdr/herdr.sock`.

@@ -12,7 +12,7 @@ use crate::scrub;
 pub const SYSTEM_PROMPT: &str = "You label terminal panes. Reply with ONLY a 1–2 word label (max 3 words, ≤24 chars) describing what the user is doing in this pane right now. Prefer concrete nouns: PR numbers (e.g. 'review PR 1283'), branch names (e.g. 'feat/moving-button'), file names, commands. No quotes, no punctuation at the end, no explanations.";
 
 const TIMEOUT: Duration = Duration::from_secs(8);
-const MAX_TOKENS: u32 = 16;
+const MAX_TOKENS: u32 = 40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -228,7 +228,10 @@ impl Provider {
             .new_agent()
     }
 
-    fn request_body(&self, user: &str) -> Value {
+    /// `retry` relaxes the Cerebras settings after an empty completion: qwen occasionally
+    /// answers with zero tokens under `reasoning_effort: none`; a little reasoning fixes it
+    /// (the reasoning lands in a separate field, `content` stays the label).
+    fn request_body_with(&self, user: &str, retry: bool) -> Value {
         match self.kind {
             Kind::Anthropic => json!({
                 "model": self.model,
@@ -241,9 +244,9 @@ impl Provider {
             // on it; `reasoning_effort: none` turns that off.
             Kind::Cerebras => json!({
                 "model": self.model,
-                "max_tokens": MAX_TOKENS,
+                "max_tokens": if retry { 256 } else { MAX_TOKENS },
                 "temperature": 0,
-                "reasoning_effort": "none",
+                "reasoning_effort": if retry { "low" } else { "none" },
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user},
@@ -277,6 +280,16 @@ impl Provider {
 
     /// Raw completion text for `user` (already scrubbed by `user_message`).
     fn complete(&self, user: &str) -> Result<String, Error> {
+        match self.complete_with(user, false) {
+            Err(Error::Empty) if self.kind == Kind::Cerebras => {
+                crate::logging::log_debug!("empty completion, retrying with reasoning");
+                self.complete_with(user, true)
+            }
+            other => other,
+        }
+    }
+
+    fn complete_with(&self, user: &str, retry: bool) -> Result<String, Error> {
         let agent = Self::agent();
         let mut req = agent
             .post(self.kind.url())
@@ -288,7 +301,7 @@ impl Provider {
             _ => req.header("authorization", &format!("Bearer {}", self.key)),
         };
         let mut resp = req
-            .send_json(self.request_body(user))
+            .send_json(self.request_body_with(user, retry))
             .map_err(|e| Error::Http(e.to_string()))?;
         let status = resp.status().as_u16();
         let body: Value = resp
@@ -302,8 +315,11 @@ impl Provider {
                 .unwrap_or("");
             return Err(Error::Http(format!("status {status}: {msg}")));
         }
-        let text = self.extract(&body).ok_or(Error::Empty)?;
+        let text = self.extract(&body).unwrap_or_default();
         if text.trim().is_empty() {
+            // Model responses carry no pane content, so a preview is safe to log.
+            let preview: String = body.to_string().chars().take(400).collect();
+            crate::logging::log_debug!("empty completion, response: {preview}");
             return Err(Error::Empty);
         }
         Ok(text)
@@ -445,5 +461,21 @@ mod tests {
         let v = json!({"choices": [{"message": {"role": "assistant", "content": "yo"}}]});
         assert_eq!(p.extract(&v).as_deref(), Some("yo"));
         assert_eq!(p.extract(&json!({})), None);
+    }
+
+    #[test]
+    fn cerebras_retry_relaxes_reasoning() {
+        let p = Provider {
+            kind: Kind::Cerebras,
+            model: "m".into(),
+            key: "k".into(),
+        };
+        let first = p.request_body_with("ctx", false);
+        assert_eq!(first["reasoning_effort"], "none");
+        assert_eq!(first["max_tokens"], MAX_TOKENS);
+        let retry = p.request_body_with("ctx", true);
+        assert_eq!(retry["reasoning_effort"], "low");
+        assert_eq!(retry["max_tokens"], 256);
+        assert_eq!(retry["messages"][1]["content"], "ctx");
     }
 }
