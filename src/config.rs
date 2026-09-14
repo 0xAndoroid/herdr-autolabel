@@ -110,17 +110,26 @@ impl Config {
 
 /// Minimal glob: `*` matches any run (including `/`), `?` one char, everything else literal.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    fn go(p: &[char], t: &[char]) -> bool {
-        match p.split_first() {
-            None => t.is_empty(),
-            Some(('*', rest)) => (0..=t.len()).any(|i| go(rest, &t[i..])),
-            Some(('?', rest)) => !t.is_empty() && go(rest, &t[1..]),
-            Some((c, rest)) => t.first() == Some(c) && go(rest, &t[1..]),
-        }
-    }
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
-    go(&p, &t)
+    let (mut pi, mut ti) = (0, 0);
+    let mut star = None;
+    while ti < t.len() {
+        if p.get(pi) == Some(&'*') {
+            star = Some((pi, ti));
+            pi += 1;
+        } else if p.get(pi).is_some_and(|c| *c == '?' || *c == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some((at, matched)) = star {
+            ti = matched + 1;
+            pi = at + 1;
+            star = Some((at, ti));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
 }
 
 #[cfg(test)]
@@ -191,5 +200,12 @@ mod tests {
         assert!(!glob_match("w?:p1", "w10:p1"));
         assert!(glob_match("*.log", "a/b/c.log"));
         assert!(!glob_match("abc", "abcd"));
+        assert!(glob_match("?", "界"));
+        assert!(glob_match("[x]", "[x]"));
+        assert!(!glob_match("[x]", "x"));
+        assert!(!glob_match(
+            &format!("{}b", "*a".repeat(30)),
+            &"a".repeat(60)
+        ));
     }
 }
