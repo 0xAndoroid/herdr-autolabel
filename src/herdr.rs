@@ -2,10 +2,10 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -148,13 +148,11 @@ impl Client {
         line.push('\n');
         stream.write_all(line.as_bytes()).map_err(Error::Io)?;
         stream.flush().map_err(Error::Io)?;
-        let mut reader = BufReader::new(stream);
-        let mut response = String::new();
-        let n = reader.read_line(&mut response).map_err(Error::Io)?;
-        if n == 0 {
-            return Err(Error::Protocol("empty response".into()));
+        let response = read_frame(&mut stream, TIMEOUT)?;
+        let value: Value = serde_json::from_slice(&response)?;
+        if value.get("id").and_then(Value::as_str) != Some(id.as_str()) {
+            return Err(Error::Protocol("response id mismatch".into()));
         }
-        let value: Value = serde_json::from_str(response.trim_end())?;
         if let Some(err) = value.get("error") {
             return Err(Error::Api {
                 code: err
@@ -169,9 +167,6 @@ impl Client {
                     .to_string(),
             });
         }
-        if value.get("id").and_then(Value::as_str) != Some(id.as_str()) {
-            return Err(Error::Protocol("response id mismatch".into()));
-        }
         value
             .get("result")
             .cloned()
@@ -179,7 +174,7 @@ impl Client {
     }
 
     /// Calls `method` and unwraps the typed payload: herdr wraps results as
-    /// `{"type": "<variant>", "<key>": {...}}`; older/other shapes are accepted as-is.
+    /// `{"type": "<variant>", "<key>": {...}}`.
     fn call_payload<T: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -187,10 +182,10 @@ impl Client {
         key: &str,
     ) -> Result<T, Error> {
         let mut result = self.call(method, params)?;
-        let payload = match result.get_mut(key) {
-            Some(inner) => inner.take(),
-            None => result,
-        };
+        let payload = result
+            .get_mut(key)
+            .ok_or_else(|| Error::Protocol(format!("missing {key} payload")))?
+            .take();
         Ok(serde_json::from_value(payload)?)
     }
 
@@ -237,6 +232,30 @@ impl Client {
     }
 }
 
+fn read_frame(stream: &mut UnixStream, timeout: Duration) -> Result<Vec<u8>, Error> {
+    let deadline = Instant::now() + timeout;
+    let mut response = Vec::new();
+    let mut buffer = [0; 4096];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Io(std::io::ErrorKind::TimedOut.into()));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(Error::Io)?;
+        let n = stream.read(&mut buffer).map_err(Error::Io)?;
+        if n == 0 {
+            return Err(Error::Protocol("response ended before newline".into()));
+        }
+        if let Some(end) = buffer[..n].iter().position(|b| *b == b'\n') {
+            response.extend_from_slice(&buffer[..end]);
+            return Ok(response);
+        }
+        response.extend_from_slice(&buffer[..n]);
+    }
+}
+
 /// Default socket: `HERDR_SOCKET_PATH`, else `~/.config/herdr/herdr.sock`.
 pub fn default_socket_path() -> PathBuf {
     if let Some(p) = std::env::var_os("HERDR_SOCKET_PATH").filter(|p| !p.is_empty()) {
@@ -254,6 +273,7 @@ pub fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
 
     fn serve_once(sock: PathBuf, reply: impl Fn(&Value) -> String + Send + 'static) {
@@ -311,6 +331,62 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let _ = std::fs::remove_file(&s);
+    }
+
+    #[test]
+    fn frame_requires_newline_and_obeys_deadline() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(b"{}").unwrap();
+        assert!(matches!(
+            read_frame(&mut client, Duration::from_millis(20)),
+            Err(Error::Io(_))
+        ));
+        drop(server);
+        assert!(read_frame(&mut client, TIMEOUT).is_err());
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            server.write_all(b"{\"ok\":").unwrap();
+            std::thread::sleep(Duration::from_millis(10));
+            server.write_all(b"true}\n").unwrap();
+        });
+        assert_eq!(read_frame(&mut client, TIMEOUT).unwrap(), b"{\"ok\":true}");
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn typed_requests_and_clear_are_source_scoped() {
+        let s = sock("typed");
+        serve_once(s.clone(), |req| {
+            assert_eq!(req["method"], "pane.read");
+            assert_eq!(req["params"]["source"], "recent_unwrapped");
+            assert_eq!(req["params"]["lines"], 40);
+            json!({"id": req["id"], "result": {"type": "pane_read", "read": {"text": "ready"}}})
+                .to_string()
+        });
+        assert_eq!(Client::new(&s).read_recent("p1", 40).unwrap().text, "ready");
+        std::fs::remove_file(&s).unwrap();
+        serve_once(s.clone(), |req| {
+            assert_eq!(
+                req["params"],
+                json!({"pane_id": "p1", "source": SOURCE, "clear_title": true})
+            );
+            json!({"id": req["id"], "result": {"type": "ok"}}).to_string()
+        });
+        Client::new(&s).clear_title("p1").unwrap();
+        std::fs::remove_file(&s).unwrap();
+    }
+
+    #[test]
+    fn missing_payload_is_not_an_empty_snapshot() {
+        let s = sock("payload");
+        serve_once(s.clone(), |req| {
+            json!({"id": req["id"], "result": {"type": "ok"}}).to_string()
+        });
+        assert!(matches!(
+            Client::new(&s).snapshot(),
+            Err(Error::Protocol(_))
+        ));
+        std::fs::remove_file(&s).unwrap();
     }
 
     #[test]
