@@ -185,6 +185,12 @@ pub fn agent_of(proc_: &Proc) -> Option<String> {
     if is_agent(&cmd) {
         return Some(cmd);
     }
+    if !matches!(
+        cmd.as_str(),
+        "node" | "bun" | "deno" | "tsx" | "ts-node" | "python" | "python3"
+    ) {
+        return None;
+    }
     let script = proc_.argv.get(1)?;
     script.split('/').rev().find_map(|part| {
         let part = part.trim_end_matches(".js").trim_end_matches(".mjs");
@@ -313,6 +319,7 @@ fn known_process_label(proc_: &Proc) -> Option<String> {
                 .any(|a| a == "-f" || a == "-F" || a.starts_with("--follow"));
             Some(match (follow, file) {
                 (true, Some(f)) => format!("tail -f {f}"),
+                (true, None) => "tail -f".into(),
                 (_, f) => two("tail", f.as_deref()),
             })
         }
@@ -365,7 +372,8 @@ fn known_process_label(proc_: &Proc) -> Option<String> {
             let mut pos = positionals(args).into_iter();
             match pos.next() {
                 Some("run") => {
-                    let rest: Vec<&str> = pos.collect();
+                    let run = args.iter().position(|a| a == "run").unwrap();
+                    let rest: Vec<&str> = args[run + 1..].iter().map(String::as_str).collect();
                     if rest.is_empty() {
                         Some("uv run".into())
                     } else {
@@ -430,7 +438,14 @@ pub fn generic_label(proc_: &Proc) -> String {
 
 /// Decides how to label a pane.
 pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
-    let fin = |s: &str| label::finalize(s, 3, max_chars);
+    let fin = |s: &str| {
+        let cleaned = label::finalize(s, 3, max_chars);
+        if cleaned.is_empty() {
+            label::truncate_words("shell", max_chars)
+        } else {
+            cleaned
+        }
+    };
     let agent_kind = facts
         .agent
         .clone()
@@ -525,6 +540,22 @@ mod tests {
                 None,
                 "ssh mini.local",
             ),
+            (&["vim"], "/r", None, "vim"),
+            (&["node"], "/r", None, "node"),
+            (&["bun", "run", "dev"], "/r", None, "bun dev"),
+            (&["tail", "-f"], "/r", None, "tail -f"),
+            (&["less"], "/r", None, "less"),
+            (&["man"], "/r", None, "man"),
+            (&["fish"], "/r", None, "r"),
+            (&["nu"], "/r", None, "r"),
+            (&["nvim", "/src/claude/main.rs"], "/r", None, "nvim main.rs"),
+            (
+                &["uv", "run", "python", "-m", "pytest"],
+                "/r",
+                None,
+                "pytest",
+            ),
+            (&[], "/...", None, "shell"),
             (&["htop"], "/r", None, "htop"),
             (&["git", "rebase", "-i", "HEAD~3"], "/r", None, "git rebase"),
             (&["git", "-C", "/x", "status"], "/r", None, "git status"),
