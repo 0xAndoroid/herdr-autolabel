@@ -316,7 +316,9 @@ impl Daemon {
         };
 
         if let Some(source) = self.skip_pane(pane, stats)? {
-            // Skipped panes still tell their space what they show.
+            // Skipped panes still tell their space what they show. A title from another source
+            // (or from a previous run of ours) is already a whole name; a hand-typed pane name
+            // is the activity.
             let shown = match source {
                 Source::SkippedManual => pane.label.clone(),
                 Source::SkippedTitle => pane.title.clone(),
@@ -330,7 +332,7 @@ impl Daemon {
                             label: label.trim().to_string(),
                             agent: pane.agent.as_deref().is_some_and(|a| !a.is_empty()),
                             busy: true,
-                            whole: false,
+                            whole: source == Source::SkippedTitle,
                             project: heuristics::project(&cwd),
                         },
                     );
@@ -342,27 +344,33 @@ impl Daemon {
             return Ok(outcome(None, source, false));
         }
 
-        let procs: Vec<Proc> = match self.client.process_info(&id) {
-            Ok(info) => info
-                .foreground_processes
-                .into_iter()
-                .map(|p| Proc {
-                    argv: p
-                        .argv
-                        .unwrap_or_else(|| p.argv0.clone().map(|a| vec![a]).unwrap_or_default()),
-                    name: p.name,
-                })
-                .collect(),
+        let (procs, leader): (Vec<Proc>, Option<u32>) = match self.client.process_info(&id) {
+            Ok(info) => (
+                info.foreground_processes
+                    .into_iter()
+                    .map(|p| Proc {
+                        pid: p.pid,
+                        argv: p.argv.unwrap_or_else(|| {
+                            p.argv0.clone().map(|a| vec![a]).unwrap_or_default()
+                        }),
+                        name: p.name,
+                    })
+                    .collect(),
+                info.foreground_process_group_id,
+            ),
             Err(herdr::Error::Connect(e)) => return Err(herdr::Error::Connect(e)),
             Err(e) => {
                 log_debug!("{id}: process_info failed: {e}");
-                Vec::new()
+                (Vec::new(), None)
             }
         };
         if SHUTDOWN.load(Ordering::Relaxed) {
             return Ok(outcome(None, Source::Unchanged, false));
         }
-        let fg = heuristics::pick_foreground(&procs);
+        let fg = heuristics::pick_foreground(&procs, leader);
+        let child = fg
+            .as_ref()
+            .and_then(|typed| heuristics::running_child(&procs, typed));
         let branch = if cwd.is_empty() {
             None
         } else {
@@ -379,12 +387,13 @@ impl Daemon {
             agent: pane.agent.clone().filter(|a| !a.is_empty()),
             agent_status: agent_status.clone(),
         };
-        // The agent's transcript has the user's last prompt verbatim; herdr reports the session.
-        let prompt = pane
-            .agent_session
-            .as_ref()
-            .filter(|s| !s.value.is_empty())
-            .and_then(|s| self.prompts.last(s));
+        // The agent's transcript has the user's prompts verbatim; herdr reports the session.
+        let session = pane.agent_session.as_ref().filter(|s| !s.value.is_empty());
+        let prompt = session.and_then(|s| self.prompts.last(s));
+        let first_prompt = session
+            .filter(|_| prompt.is_some())
+            .and_then(|s| self.prompts.first(s))
+            .filter(|f| Some(f) != prompt.as_ref());
         let project = heuristics::project(&cwd);
         let agent_kind = facts
             .agent
@@ -406,6 +415,12 @@ impl Daemon {
                 .map(|p| {
                     let mut v = vec![p.command()];
                     v.extend(p.argv.iter().skip(1).take(2).cloned());
+                    // A command's phases (`docker build`, then `docker logs`) relabel it; an
+                    // agent's tool calls do not.
+                    if let Some(c) = child.as_ref().filter(|_| agent_kind.is_none()) {
+                        v.push(c.command());
+                        v.extend(c.argv.iter().skip(1).take(1).cloned());
+                    }
                     v
                 })
                 .unwrap_or_default(),
@@ -450,8 +465,10 @@ impl Daemon {
                         log_debug!("{id}: llm rate-limited; keeping previous label");
                         // Keep the previous label (or the fallback when there is none) and don't
                         // record the fingerprint so the next pass retries.
-                        let previous = self.labels.get(&id).map(|l| l.label.clone());
-                        (previous.unwrap_or(fallback), Source::RateLimited, false)
+                        match self.labels.get(&id).map(|l| l.label.clone()) {
+                            Some(previous) => (previous, Source::RateLimited, false),
+                            None => (fallback, Source::Fallback, false),
+                        }
                     } else {
                         // The screen is read only now: it never enters the fingerprint, so
                         // unchanged panes cost one process_info call and herdr's read-time
@@ -468,15 +485,19 @@ impl Daemon {
                         stats.llm_calls += 1;
                         self.total_llm_calls += 1;
                         let fg_cmdline = fg.as_ref().map(|p| p.argv.join(" "));
+                        let child_cmdline = child.as_ref().map(|p| p.argv.join(" "));
                         let cwd_base = heuristics::basename(cwd.trim_end_matches('/'));
                         let ctx = llm::Context {
                             agent: facts.agent.as_deref(),
                             agent_status: facts.agent.as_ref().map(|_| agent_status.as_str()),
                             process: fg_cmdline.as_deref(),
+                            running: child_cmdline.as_deref(),
                             project: project.as_deref(),
                             cwd_basename: &cwd_base,
                             branch: branch.as_deref(),
                             request,
+                            topic: title,
+                            first_request: first_prompt.as_deref(),
                             lines: &lines,
                         };
                         let t0 = Instant::now();
@@ -508,16 +529,22 @@ impl Daemon {
             self.labels.remove(&id);
             return Ok(outcome(None, source, false));
         }
-        self.labels.insert(
-            id.clone(),
-            PaneSummary {
-                label: label.clone(),
-                agent,
-                busy: fg.is_some(),
-                whole,
-                project,
-            },
-        );
+        // A stand-in name (no LLM, or still waiting for its budget) titles the pane only; its
+        // space keeps herdr's default until a real name exists.
+        if source == Source::Fallback {
+            self.labels.remove(&id);
+        } else {
+            self.labels.insert(
+                id.clone(),
+                PaneSummary {
+                    label: label.clone(),
+                    agent,
+                    busy: fg.is_some(),
+                    whole,
+                    project,
+                },
+            );
+        }
         if !self.config.label_panes {
             if record_fp {
                 self.last_fp.insert(id.clone(), fp);

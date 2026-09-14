@@ -15,6 +15,8 @@ use crate::herdr::AgentSession;
 
 /// Bytes read from the end of a transcript; a prompt buried deeper than this is not found.
 const TAIL_BYTES: u64 = 4 << 20;
+/// Bytes read from the start of a transcript for the first prompt.
+const HEAD_BYTES: u64 = 1 << 20;
 /// Characters of the prompt kept for the label request.
 pub const MAX_PROMPT_CHARS: usize = 300;
 /// Directory levels searched below a session root when herdr reports only an id.
@@ -30,13 +32,23 @@ struct Cached {
     path: PathBuf,
     len: u64,
     modified: Option<SystemTime>,
-    prompt: Option<String>,
+    first: Option<String>,
+    last: Option<String>,
 }
 
 impl Prompts {
     /// The user's last prompt in `session`'s transcript, when the agent's format is known and
     /// the file exists.
     pub fn last(&mut self, session: &AgentSession) -> Option<String> {
+        self.refresh(session)?.last.clone()
+    }
+
+    /// The first prompt of the session: what it is about, when the last one does not say.
+    pub fn first(&mut self, session: &AgentSession) -> Option<String> {
+        self.refresh(session)?.first.clone()
+    }
+
+    fn refresh(&mut self, session: &AgentSession) -> Option<&Cached> {
         let cached = match self
             .sessions
             .entry(format!("{}:{}", session.agent, session.value))
@@ -46,7 +58,8 @@ impl Prompts {
                 path: locate(session)?,
                 len: 0,
                 modified: None,
-                prompt: None,
+                first: None,
+                last: None,
             }),
         };
         let meta = std::fs::metadata(&cached.path).ok()?;
@@ -54,9 +67,14 @@ impl Prompts {
         if meta.len() != cached.len || modified != cached.modified {
             cached.len = meta.len();
             cached.modified = modified;
-            cached.prompt = tail(&cached.path).and_then(|t| last_prompt_in(&session.agent, &t));
+            cached.last =
+                tail(&cached.path).and_then(|t| prompt_in(&session.agent, t.lines().rev()));
+            if cached.first.is_none() {
+                cached.first =
+                    head(&cached.path).and_then(|h| prompt_in(&session.agent, h.lines()));
+            }
         }
-        cached.prompt.clone()
+        Some(cached)
     }
 }
 
@@ -118,25 +136,29 @@ fn tail(path: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// The last prompt the user typed to `agent`, as one line of at most `MAX_PROMPT_CHARS`
-/// characters. Lines are tried newest first; each format's non-prompt records are skipped.
-pub fn last_prompt_in(agent: &str, transcript: &str) -> Option<String> {
+fn head(path: &Path) -> Option<String> {
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    f.take(HEAD_BYTES).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The first prompt the user typed to `agent` among `lines` (pass them reversed for the last
+/// one), as one line of at most `MAX_PROMPT_CHARS` characters; each format's non-prompt
+/// records are skipped.
+pub fn prompt_in<'a>(agent: &str, lines: impl Iterator<Item = &'a str>) -> Option<String> {
     let (marker, prompt): (&str, fn(&str) -> Option<String>) = match agent {
         "claude" => ("\"type\":\"user\"", claude_prompt),
         "codex" => ("\"user_message\"", codex_prompt),
         "pi" => ("\"role\":\"user\"", pi_prompt),
         _ => return None,
     };
-    transcript
-        .lines()
-        .rev()
-        .filter(|l| l.contains(marker))
-        .find_map(|line| {
-            let text = prompt(line)?;
-            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            (!text.is_empty() && !is_acknowledgement(&text))
-                .then(|| text.chars().take(MAX_PROMPT_CHARS).collect())
-        })
+    lines.filter(|l| l.contains(marker)).find_map(|line| {
+        let text = prompt(line)?;
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!text.is_empty() && !is_acknowledgement(&text))
+            .then(|| text.chars().take(MAX_PROMPT_CHARS).collect())
+    })
 }
 
 /// Words a prompt may consist of entirely and still say nothing about the task ("continue",
@@ -249,6 +271,26 @@ mod tests {
         format!(r#"{{"type":"user","message":{{"role":"user","content":{content}}}{extra}}}"#)
     }
 
+    fn last(agent: &str, transcript: &str) -> Option<String> {
+        prompt_in(agent, transcript.lines().rev())
+    }
+
+    #[test]
+    fn first_prompt_skips_injected_and_acknowledgement_lines() {
+        let lines = [
+            user(r#""<command-name>/status</command-name>""#, ""),
+            user(r#""ok""#, ""),
+            user(r#""make the AI GP more chat like""#, ""),
+            user(r#""switch to fable""#, ""),
+        ]
+        .join("\n");
+        assert_eq!(
+            prompt_in("claude", lines.lines()).as_deref(),
+            Some("make the AI GP more chat like")
+        );
+        assert_eq!(last("claude", &lines).as_deref(), Some("switch to fable"));
+    }
+
     #[test]
     fn claude_last_typed_prompt_wins_over_tool_results_meta_and_injected_blocks() {
         let lines = [
@@ -262,7 +304,7 @@ mod tests {
             user(r#""ok, continue!""#, ""),
         ];
         assert_eq!(
-            last_prompt_in("claude", &lines.join("\n")).as_deref(),
+            last("claude", &lines.join("\n")).as_deref(),
             Some("fix the flaky test in auth")
         );
         // A prompt with an injected reminder block keeps only the typed block.
@@ -270,13 +312,10 @@ mod tests {
             r#"[{"type":"text","text":"<system-reminder>x</system-reminder>"},{"type":"text","text":"review PR 12"}]"#,
             "",
         );
+        assert_eq!(last("claude", &mixed).as_deref(), Some("review PR 12"));
+        assert_eq!(last("claude", ""), None);
         assert_eq!(
-            last_prompt_in("claude", &mixed).as_deref(),
-            Some("review PR 12")
-        );
-        assert_eq!(last_prompt_in("claude", ""), None);
-        assert_eq!(
-            last_prompt_in(
+            last(
                 "claude",
                 &user(r#"[{"type":"tool_result","content":"x"}]"#, "")
             ),
@@ -293,10 +332,10 @@ mod tests {
             r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done"}}"#,
         ];
         assert_eq!(
-            last_prompt_in("codex", &lines.join("\n")).as_deref(),
+            last("codex", &lines.join("\n")).as_deref(),
             Some("continue to find another one.")
         );
-        assert_eq!(last_prompt_in("codex", lines[1]), None);
+        assert_eq!(last("codex", lines[1]), None);
     }
 
     #[test]
@@ -308,16 +347,16 @@ mod tests {
             r#"{"type":"message","id":"c","message":{"role":"toolResult","content":[{"type":"text","text":"ok"}]}}"#,
         ];
         assert_eq!(
-            last_prompt_in("pi", &lines.join("\n")).as_deref(),
+            last("pi", &lines.join("\n")).as_deref(),
             Some("make the status bar colourful")
         );
-        assert_eq!(last_prompt_in("gemini", &lines.join("\n")), None);
+        assert_eq!(last("gemini", &lines.join("\n")), None);
     }
 
     #[test]
     fn prompt_is_capped() {
         let long = "word ".repeat(200);
-        let out = last_prompt_in("claude", &user(&format!("\"{long}\""), "")).unwrap();
+        let out = last("claude", &user(&format!("\"{long}\""), "")).unwrap();
         assert_eq!(out.chars().count(), MAX_PROMPT_CHARS);
     }
 

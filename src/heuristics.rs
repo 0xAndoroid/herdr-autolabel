@@ -7,6 +7,7 @@ use crate::label;
 /// A foreground process as reported by `pane.process_info`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Proc {
+    pub pid: u32,
     pub name: String,
     pub argv: Vec<String>,
 }
@@ -14,6 +15,7 @@ pub struct Proc {
 impl Proc {
     pub fn new(argv: &[&str]) -> Self {
         Self {
+            pid: 0,
             name: argv.first().map(|a| basename(a)).unwrap_or_default(),
             argv: argv.iter().map(|s| s.to_string()).collect(),
         }
@@ -214,8 +216,23 @@ pub fn basename(p: &str) -> String {
 
 /// Picks the process that best describes the pane from a foreground process group: the first
 /// non-shell entry, or `None` when the group is empty or only shells (an idle prompt).
-pub fn pick_foreground(procs: &[Proc]) -> Option<Proc> {
-    procs.iter().find(|p| !is_shell(&p.command())).cloned()
+/// The command typed at the prompt: the foreground process group's `leader`, else the first
+/// non-shell process (herdr lists the group deepest child first).
+pub fn pick_foreground(procs: &[Proc], leader: Option<u32>) -> Option<Proc> {
+    let typed = |p: &&Proc| !is_shell(&p.command());
+    procs
+        .iter()
+        .find(|p| leader.is_some_and(|l| p.pid == l) && typed(p))
+        .or_else(|| procs.iter().find(typed))
+        .cloned()
+}
+
+/// The deepest process doing the work under `typed` (`docker logs` under `shop dev`), if any.
+pub fn running_child(procs: &[Proc], typed: &Proc) -> Option<Proc> {
+    procs
+        .first()
+        .filter(|p| p.pid != typed.pid && !is_shell(&p.command()))
+        .cloned()
 }
 
 /// Default branches say nothing about the work; the directory name is more useful then.
@@ -742,13 +759,33 @@ mod tests {
     #[test]
     fn pick_foreground_skips_shells() {
         let procs = vec![Proc::new(&["-zsh"])];
-        assert_eq!(pick_foreground(&procs), None);
+        assert_eq!(pick_foreground(&procs, None), None);
         let procs = vec![
             Proc::new(&["zsh"]),
             Proc::new(&["cargo", "build"]),
             Proc::new(&["rustc"]),
         ];
-        assert_eq!(pick_foreground(&procs).unwrap().command(), "cargo");
-        assert_eq!(pick_foreground(&[]), None);
+        assert_eq!(pick_foreground(&procs, None).unwrap().command(), "cargo");
+        assert_eq!(pick_foreground(&[], None), None);
+    }
+
+    #[test]
+    fn group_leader_is_the_typed_command_and_its_first_child_the_running_one() {
+        let docker = Proc {
+            pid: 2,
+            ..Proc::new(&["docker", "logs", "-f", "0a03"])
+        };
+        let shop = Proc {
+            pid: 1,
+            ..Proc::new(&["shop", "dev", "--app", "api"])
+        };
+        let procs = vec![docker.clone(), shop.clone()];
+        let typed = pick_foreground(&procs, Some(1)).unwrap();
+        assert_eq!(typed, shop);
+        assert_eq!(running_child(&procs, &typed), Some(docker.clone()));
+        // Without a leader the first non-shell entry stands, and nothing runs under it.
+        let typed = pick_foreground(&procs, None).unwrap();
+        assert_eq!(typed, docker);
+        assert_eq!(running_child(&procs, &typed), None);
     }
 }

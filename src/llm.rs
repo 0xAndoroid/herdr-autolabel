@@ -9,10 +9,14 @@ use crate::config::Config;
 use crate::label;
 use crate::scrub;
 
-pub const SYSTEM_PROMPT: &str = "You name terminal panes for a sidebar. Reply with ONLY the name: at most the number of characters given, no quotes, no trailing punctuation, no explanation. Shape: '<project>: <task>'. <project> is a short form of the project name ('herdr' for herdr-autolabel); a repository name always stays, leave it out only for a home or scratch folder (dev, Downloads, dotfiles). <task> is a 1–3 word phrase. When a 'user's request' line is present (the user's last prompt to a coding agent, or the agent's summary of it), <task> MUST paraphrase that request and nothing else: not the file the agent has open, not the command it is running right now. Otherwise name what is being done, preferring concrete nouns: PR numbers ('review PR 1283'), branch names, file names, commands.";
+pub const SYSTEM_PROMPT: &str = "You name terminal panes for a sidebar. Reply with ONLY the name: at most the number of characters given, no quotes, no trailing punctuation, no explanation. Shape: '<project>: <task>'. <project> is a short form of the project name ('herdr' for herdr-autolabel); a repository name always stays, leave it out only for a home or scratch folder (dev, Downloads, dotfiles). <task> is a 1–3 word phrase. When a 'user's request' line is present (the user's last prompt to a coding agent, or the agent's summary of it), <task> MUST paraphrase that request and nothing else: not the file the agent has open, not the command it is running right now. 'session topic' and 'session's first request' say what the whole session is about and serve <project> only: when they, the branch or the command name an app or sub-project inside the repository, that is the <project> ('api: switch to fable' for the api app in the shop repository); they never shape <task>. Otherwise name what is being done, preferring concrete nouns: PR numbers ('review PR 1283'), branch names, file names, commands. For a shell command, keep the argument that tells this run apart (the app, service, target or file) and say what runs under it: 'api docker logs' for `shop dev --app api` running `docker logs`, never the bare tool.";
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_TOKENS: u32 = 40;
+/// gpt-5.6 reasons at `medium` before answering: slower, and the reasoning tokens count
+/// against the completion budget.
+const OPENAI_TIMEOUT: Duration = Duration::from_secs(30);
+const OPENAI_MAX_COMPLETION_TOKENS: u32 = 2048;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -42,7 +46,7 @@ impl Kind {
         match self {
             Kind::Cerebras => "qwen-3.8-27b",
             Kind::Anthropic => "claude-haiku-4-5",
-            Kind::OpenAi => "gpt-5-mini",
+            Kind::OpenAi => "gpt-5.6-luna",
         }
     }
 
@@ -64,7 +68,7 @@ impl Kind {
     }
 }
 
-const AUTO_ORDER: [Kind; 3] = [Kind::Cerebras, Kind::Anthropic, Kind::OpenAi];
+const AUTO_ORDER: [Kind; 2] = [Kind::Cerebras, Kind::OpenAi];
 
 #[derive(Debug, Clone)]
 pub struct Provider {
@@ -128,7 +132,7 @@ pub fn key_from_keysrc(text: &str, name: &str) -> Option<String> {
     None
 }
 
-/// Picks the provider per config (`auto` = first of cerebras → anthropic → openai with a key).
+/// Picks the provider per config (`auto` = cerebras, else openai, by key presence).
 pub fn select(config: &Config) -> Result<Option<Provider>, String> {
     let build = |kind: Kind, key: String| Provider {
         kind,
@@ -162,7 +166,10 @@ pub fn select(config: &Config) -> Result<Option<Provider>, String> {
 pub struct Context<'a> {
     pub agent: Option<&'a str>,
     pub agent_status: Option<&'a str>,
+    /// The command typed at the prompt (for an agent pane, the agent binary itself).
     pub process: Option<&'a str>,
+    /// The deepest process working under it: `docker logs` under `shop dev`, an agent's tool.
+    pub running: Option<&'a str>,
     /// Repository checkout name without a worktree suffix; the model shortens or omits it.
     pub project: Option<&'a str>,
     pub cwd_basename: &'a str,
@@ -171,6 +178,11 @@ pub struct Context<'a> {
     /// summary coding agents keep in the terminal title; heads the prompt as the request the
     /// task must paraphrase.
     pub request: Option<&'a str>,
+    /// The summary the agent keeps in its terminal title (Claude Code, Codex): what the whole
+    /// session is about. Context for the project, not the task.
+    pub topic: Option<&'a str>,
+    /// The session's first prompt, when it differs from the request; same role as `topic`.
+    pub first_request: Option<&'a str>,
     pub lines: &'a [&'a str],
 }
 
@@ -182,6 +194,12 @@ pub fn user_message(ctx: &Context, max_chars: usize) -> String {
     if let Some(r) = ctx.request {
         out.push_str(&format!("user's request: {}\n", clean(r)));
     }
+    if let Some(t) = ctx.topic.filter(|t| Some(*t) != ctx.request) {
+        out.push_str(&format!("session topic: {}\n", clean(t)));
+    }
+    if let Some(f) = ctx.first_request {
+        out.push_str(&format!("session's first request: {}\n", clean(f)));
+    }
     if let Some(a) = ctx.agent {
         out.push_str(&format!("agent: {}", clean(a)));
         if let Some(s) = ctx.agent_status {
@@ -189,13 +207,17 @@ pub fn user_message(ctx: &Context, max_chars: usize) -> String {
         }
         out.push('\n');
     }
-    if let Some(p) = ctx.process {
-        let what = if ctx.agent.is_some() {
-            "command the agent is running"
-        } else {
-            "foreground process"
-        };
-        out.push_str(&format!("{what}: {}\n", clean(p)));
+    if ctx.agent.is_some() {
+        if let Some(r) = ctx.running {
+            out.push_str(&format!("command the agent is running: {}\n", clean(r)));
+        }
+    } else {
+        if let Some(p) = ctx.process {
+            out.push_str(&format!("command: {}\n", clean(p)));
+        }
+        if let Some(r) = ctx.running {
+            out.push_str(&format!("now running under it: {}\n", clean(r)));
+        }
     }
     if let Some(p) = ctx.project {
         out.push_str(&format!("project: {}\n", clean(p)));
@@ -239,9 +261,16 @@ fn pr_mentions(lines: &[String]) -> Vec<String> {
 }
 
 impl Provider {
-    fn agent() -> ureq::Agent {
+    fn timeout(&self) -> Duration {
+        match self.kind {
+            Kind::OpenAi => OPENAI_TIMEOUT,
+            Kind::Cerebras | Kind::Anthropic => TIMEOUT,
+        }
+    }
+
+    fn agent(&self) -> ureq::Agent {
         ureq::Agent::config_builder()
-            .timeout_global(Some(TIMEOUT))
+            .timeout_global(Some(self.timeout()))
             .http_status_as_error(false)
             .build()
             .new_agent()
@@ -271,11 +300,12 @@ impl Provider {
                     {"role": "user", "content": user},
                 ],
             }),
-            // gpt-5 family rejects `max_tokens` and non-default temperature.
+            // gpt-5 family rejects `max_tokens` and non-default temperature; the completion
+            // budget covers the reasoning as well as the name.
             Kind::OpenAi => json!({
                 "model": self.model,
-                "max_completion_tokens": MAX_TOKENS.max(64),
-                "reasoning_effort": "minimal",
+                "max_completion_tokens": OPENAI_MAX_COMPLETION_TOKENS,
+                "reasoning_effort": "medium",
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user},
@@ -309,7 +339,7 @@ impl Provider {
     }
 
     fn complete_with(&self, user: &str, retry: bool) -> Result<String, Error> {
-        let agent = Self::agent();
+        let agent = self.agent();
         let mut req = agent
             .post(self.kind.url())
             .header("content-type", "application/json");
@@ -426,16 +456,40 @@ mod tests {
         let ctx = Context {
             agent: Some("claude"),
             agent_status: Some("working"),
-            process: None,
+            process: Some("claude"),
+            running: Some("cargo test"),
             project: Some("jolt"),
             cwd_basename: "pika",
             branch: Some("main"),
             request: Some("Review PR"),
+            topic: Some("AI GP agent design"),
+            first_request: Some("make the AI GP more chat like"),
             lines: &lines,
         };
         let msg = user_message(&ctx, 25);
-        assert!(msg.contains("agent: claude (working)"));
-        assert!(msg.starts_with("user's request: Review PR\nagent: claude"));
+        assert!(
+            msg.contains("agent: claude (working)\ncommand the agent is running: cargo test\n")
+        );
+        assert!(!msg.contains("command: claude"));
+        assert!(msg.starts_with(
+            "user's request: Review PR\nsession topic: AI GP agent design\nsession's first request: make the AI GP more chat like\nagent: claude"
+        ));
+        // A title that is the request itself (no transcript) is not repeated as the topic.
+        let titled = Context {
+            request: Some("Review PR"),
+            topic: Some("Review PR"),
+            ..Context::default()
+        };
+        assert!(!user_message(&titled, 25).contains("session topic"));
+        let shell = Context {
+            process: Some("shop dev --app api"),
+            running: Some("docker logs -f 0a03"),
+            cwd_basename: "shop",
+            ..Context::default()
+        };
+        assert!(user_message(&shell, 25).contains(
+            "command: shop dev --app api\nnow running under it: docker logs -f 0a03\ncwd: shop\n"
+        ));
         assert!(
             msg.contains(
                 "project: jolt\ncwd: pika\ngit branch: main\nname budget: 25 characters\n"
@@ -454,10 +508,13 @@ mod tests {
             agent: Some("password=hunter2"),
             agent_status: Some("token=hunter2"),
             process: Some("worker password='hunter2'"),
+            running: Some("child token=hunter2"),
             project: Some("password=hunter2"),
             cwd_basename: "secret=hunter2",
             branch: Some("api_key=hunter2"),
             request: Some("Bearer hunter2hunter2"),
+            topic: Some("sk-hunter2hunter2hunter2"),
+            first_request: Some("ghp_hunter2hunter2hunter2hunter2hunter2"),
             lines: &["safe"],
         };
         assert!(!user_message(&ctx, 25).contains("hunter2"));
@@ -507,5 +564,19 @@ mod tests {
         assert_eq!(retry["reasoning_effort"], "low");
         assert_eq!(retry["max_tokens"], 256);
         assert_eq!(retry["messages"][1]["content"], "ctx");
+    }
+
+    #[test]
+    fn openai_reasons_at_medium_within_a_wide_budget() {
+        let p = Provider {
+            kind: Kind::OpenAi,
+            model: "m".into(),
+            key: "k".into(),
+        };
+        let body = p.request_body_with("ctx", false);
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert_eq!(body["max_completion_tokens"], OPENAI_MAX_COMPLETION_TOKENS);
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(p.timeout(), OPENAI_TIMEOUT);
     }
 }
