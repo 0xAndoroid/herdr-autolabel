@@ -23,7 +23,7 @@ lines = 40
 # Minimum seconds between LLM calls for the same pane.
 llm_per_pane_secs = 15
 
-# Global LLM budget, calls per minute (token bucket).
+# Global LLM budget, calls per minute (rolling 60-second window).
 llm_global_per_min = 6
 
 # Globs matched against pane_id ("w1:p2"), workspace_id ("w1") and cwd.

@@ -1,37 +1,23 @@
-//! LLM call budget: per-pane minimum spacing plus a global token bucket.
+//! LLM call budget: per-pane minimum spacing plus a rolling one-minute global budget.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 pub struct RateLimiter {
     per_pane_min: Duration,
     last_call: HashMap<String, Instant>,
-    /// Token bucket: `tokens` refills at `per_min / 60` tokens per second up to `per_min`.
-    capacity: f64,
-    tokens: f64,
-    refill_per_sec: f64,
-    last_refill: Instant,
+    capacity: usize,
+    calls: VecDeque<Instant>,
 }
 
 impl RateLimiter {
     pub fn new(per_pane_min: Duration, global_per_min: u32) -> Self {
-        let capacity = f64::from(global_per_min.max(1));
         Self {
-            per_pane_min,
+            per_pane_min: per_pane_min.max(Duration::from_secs(15)),
             last_call: HashMap::new(),
-            capacity,
-            tokens: capacity,
-            refill_per_sec: capacity / 60.0,
-            last_refill: Instant::now(),
+            capacity: global_per_min.clamp(1, 6) as usize,
+            calls: VecDeque::new(),
         }
-    }
-
-    fn refill(&mut self, now: Instant) {
-        let elapsed = now
-            .saturating_duration_since(self.last_refill)
-            .as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.refill_per_sec).min(self.capacity);
-        self.last_refill = now;
     }
 
     /// Reserves one LLM call for `pane` at `now`; returns false when either limit blocks it.
@@ -41,11 +27,17 @@ impl RateLimiter {
         {
             return false;
         }
-        self.refill(now);
-        if self.tokens < 1.0 {
+        while self
+            .calls
+            .front()
+            .is_some_and(|t| now.saturating_duration_since(*t) >= Duration::from_secs(60))
+        {
+            self.calls.pop_front();
+        }
+        if self.calls.len() >= self.capacity {
             return false;
         }
-        self.tokens -= 1.0;
+        self.calls.push_back(now);
         self.last_call.insert(pane.to_string(), now);
         true
     }
@@ -75,17 +67,16 @@ mod tests {
     }
 
     #[test]
-    fn global_bucket_caps_burst_and_refills() {
+    fn rolling_minute_caps_calls() {
         let t0 = Instant::now();
         let mut rl = RateLimiter::new(Duration::ZERO, 6);
         for i in 0..6 {
             assert!(rl.try_acquire_at(&format!("p{i}"), t0), "call {i}");
         }
         assert!(!rl.try_acquire_at("p9", t0));
-        // 6/min → one token every 10 s.
-        assert!(!rl.try_acquire_at("p9", t0 + Duration::from_secs(9)));
-        assert!(rl.try_acquire_at("p9", t0 + Duration::from_secs(10)));
-        assert!(!rl.try_acquire_at("p8", t0 + Duration::from_secs(10)));
+        assert!(!rl.try_acquire_at("p9", t0 + Duration::from_secs(10)));
+        assert!(!rl.try_acquire_at("p9", t0 + Duration::from_secs(59)));
+        assert!(rl.try_acquire_at("p9", t0 + Duration::from_secs(60)));
         // Never exceeds capacity after a long idle.
         assert!(rl.try_acquire_at("q0", t0 + Duration::from_secs(1000)));
         for i in 1..6 {
