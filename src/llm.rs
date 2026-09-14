@@ -170,20 +170,21 @@ pub struct Context<'a> {
 
 /// Builds the user message: facts block, PR mentions, then the scrubbed screen.
 pub fn user_message(ctx: &Context) -> String {
+    let clean = |value: &str| scrub::scrub_line(&value.replace(['\n', '\r'], " "));
     let mut out = String::new();
     if let Some(a) = ctx.agent {
-        out.push_str(&format!("agent: {a}"));
+        out.push_str(&format!("agent: {}", clean(a)));
         if let Some(s) = ctx.agent_status {
-            out.push_str(&format!(" ({s})"));
+            out.push_str(&format!(" ({})", clean(s)));
         }
         out.push('\n');
     }
     if let Some(p) = ctx.process {
-        out.push_str(&format!("foreground process: {p}\n"));
+        out.push_str(&format!("foreground process: {}\n", clean(p)));
     }
-    out.push_str(&format!("cwd: {}\n", ctx.cwd_basename));
+    out.push_str(&format!("cwd: {}\n", clean(ctx.cwd_basename)));
     if let Some(b) = ctx.branch {
-        out.push_str(&format!("git branch: {b}\n"));
+        out.push_str(&format!("git branch: {}\n", clean(b)));
     }
     let scrubbed = scrub::scrub_lines(ctx.lines.iter().copied());
     let prs = pr_mentions(&scrubbed);
@@ -275,7 +276,7 @@ impl Provider {
     }
 
     /// Raw completion text for `user` (already scrubbed by `user_message`).
-    pub fn complete(&self, user: &str) -> Result<String, Error> {
+    fn complete(&self, user: &str) -> Result<String, Error> {
         let agent = Self::agent();
         let mut req = agent
             .post(self.kind.url())
@@ -401,6 +402,19 @@ mod tests {
         assert!(msg.contains("PRs mentioned: PR 1283, PR 77"));
         assert!(!msg.contains("sk-abcdefghijkl"));
         assert!(msg.contains("OPENAI_API_KEY=[redacted]"));
+    }
+
+    #[test]
+    fn all_prompt_facts_are_scrubbed() {
+        let ctx = Context {
+            agent: Some("password=hunter2"),
+            agent_status: Some("token=hunter2"),
+            process: Some("worker password='hunter2'"),
+            cwd_basename: "secret=hunter2",
+            branch: Some("api_key=hunter2"),
+            lines: &["safe"],
+        };
+        assert!(!user_message(&ctx).contains("hunter2"));
     }
 
     #[test]

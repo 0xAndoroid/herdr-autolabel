@@ -15,6 +15,7 @@ struct Patterns {
     keyed: Regex,
     /// Patterns whose whole match is replaced.
     whole: Vec<Regex>,
+    opaque: Regex,
 }
 
 fn patterns() -> &'static Patterns {
@@ -22,7 +23,7 @@ fn patterns() -> &'static Patterns {
     P.get_or_init(|| Patterns {
         header: Regex::new(r"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*:\s*).+$").unwrap(),
         keyed: Regex::new(
-            r#"(?i)\b([A-Za-z0-9_-]*(?:token|api[_-]?key|secret|password|passwd|authorization|cookie)[A-Za-z0-9_-]*)(\s*[=:]\s*)[^\s'"]+"#,
+            r#"(?i)\b([A-Za-z0-9_-]*(?:token|api[_-]?key|secret|password|passwd|authorization|cookie)[A-Za-z0-9_-]*)(["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#,
         )
         .unwrap(),
         whole: [
@@ -35,11 +36,11 @@ fn patterns() -> &'static Patterns {
             r"\bAKIA[0-9A-Z]{12,}",
             r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+",
             r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
-            r"[A-Za-z0-9+/=_-]{40,}",
         ]
         .iter()
         .map(|p| Regex::new(p).unwrap())
         .collect(),
+        opaque: Regex::new(r"[A-Za-z0-9+/=_-]{40,}").unwrap(),
     })
 }
 
@@ -54,6 +55,17 @@ pub fn scrub_line(line: &str) -> String {
             out = re.replace_all(&out, REDACTED).into_owned();
         }
     }
+    out = p
+        .opaque
+        .replace_all(&out, |caps: &regex::Captures| {
+            let value = &caps[0];
+            if value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+                value.to_string()
+            } else {
+                REDACTED.to_string()
+            }
+        })
+        .into_owned();
     truncate_chars(&out, MAX_LINE_CHARS)
 }
 
@@ -97,6 +109,28 @@ mod tests {
     }
 
     #[test]
+    fn quoted_secrets_and_query_tokens() {
+        for line in [
+            r#"export ANTHROPIC_API_KEY="short secret""#,
+            r#"{"password": "hunter2"}"#,
+            "password='hunter2'",
+            "https://example.test/?token=hunter2&view=1",
+            "Authorization: Bearer hunter2",
+            r#"password="hunter2"#,
+        ] {
+            let clean = scrub_line(line);
+            assert!(
+                !clean.contains("hunter2") && !clean.contains("short secret"),
+                "{clean}"
+            );
+            assert!(redacted(&clean));
+        }
+        let sha = "0123456789abcdef0123456789abcdef01234567";
+        assert_eq!(scrub_line(sha), sha);
+        assert_eq!(scrub_line(&format!("token={sha}")), "token=[redacted]");
+    }
+
+    #[test]
     fn bearer() {
         assert_eq!(
             scrub_line("curl -H 'Bearer abcdef' x"),
@@ -132,7 +166,7 @@ mod tests {
 
     #[test]
     fn long_opaque_runs() {
-        let run = "A".repeat(40);
+        let run = "Z".repeat(40);
         assert_eq!(
             scrub_line(&format!("hash {run} end")),
             "hash [redacted] end"
