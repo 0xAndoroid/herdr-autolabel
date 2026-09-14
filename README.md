@@ -14,7 +14,7 @@ The `[[startup]]` hook runs on every herdr server start (and live handoff) and s
 
 ## How labels are derived
 
-- **Idle shell** → git branch if the cwd is in a repo (read from `.git/HEAD`, no subprocess), else cwd basename.
+- **Idle shell** → git branch if the cwd is in a repo (read from `.git/HEAD`, no subprocess) and the branch is not a default one (`main`/`master`/`trunk`/`develop`), else cwd basename.
 - **Known process** (cargo, git, npm/pnpm/yarn/bun, make, just, pytest, go, python, node, editors, ssh, htop, less, man, tail, docker, kubectl, gh, …) → deterministic `<tool> <subcommand|file|host>`, no LLM.
 - **Agent panes** (claude, codex, pi, gemini, cursor, opencode, …) **and unknown long-running processes** → LLM over the scrubbed last 40 lines + cwd/branch/PR mentions; on failure or `provider = "none"` → `<agent> <branch|cwd>` / `<cmd> <arg>`.
 

@@ -212,9 +212,14 @@ pub fn pick_foreground(procs: &[Proc]) -> Option<Proc> {
     procs.iter().find(|p| !is_shell(&p.command())).cloned()
 }
 
+/// Default branches say nothing about the work; the directory name is more useful then.
+fn is_default_branch(branch: &str) -> bool {
+    matches!(branch, "main" | "master" | "trunk" | "develop")
+}
+
 fn idle_label(facts: &PaneFacts) -> String {
     match &facts.branch {
-        Some(b) if !b.is_empty() => b.clone(),
+        Some(b) if !b.is_empty() && !is_default_branch(b) => b.clone(),
         _ => {
             let base = basename(facts.cwd.trim_end_matches('/'));
             if base.is_empty() {
@@ -513,6 +518,8 @@ mod tests {
                 "feat/daemon",
             ),
             (&["zsh"], "/Users/me/Downloads", None, "Downloads"),
+            (&["zsh"], "/Users/me/dev/pika", Some("main"), "pika"),
+            (&["fish"], "/Users/me/dev/pika", Some("master"), "pika"),
             (&["/bin/bash"], "/", None, "shell"),
             (
                 &["cargo", "build", "--release"],
@@ -635,7 +642,7 @@ mod tests {
         assert_eq!(
             decide(&f, 24),
             Decision::Llm {
-                fallback: "claude main".into()
+                fallback: "claude pika".into()
             }
         );
         f.fg = Some(Proc::new(&["zsh"]));

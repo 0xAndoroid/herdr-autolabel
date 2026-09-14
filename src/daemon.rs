@@ -542,12 +542,19 @@ mod tests {
     ) -> (Daemon, std::thread::JoinHandle<()>) {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
-        let socket = std::env::temp_dir().join(format!("hal-{name}-{}.sock", std::process::id()));
+        // Unique per invocation so concurrent tests never share sockets or budget files.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("hal-{name}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("s.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let paths = Paths {
             socket: socket.clone(),
-            state_dir: std::env::temp_dir(),
-            config_dir: std::env::temp_dir(),
+            state_dir: dir.clone(),
+            config_dir: dir.clone(),
         };
         let server = std::thread::spawn(move || {
             for (method, response) in replies {
@@ -565,7 +572,7 @@ mod tests {
                 response["id"] = request["id"].clone();
                 writeln!(stream, "{response}").unwrap();
             }
-            std::fs::remove_file(socket).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
         });
         (Daemon::new(paths, Config::default(), None), server)
     }
