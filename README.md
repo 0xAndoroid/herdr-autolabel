@@ -61,7 +61,7 @@ macOS + Linux.
 
 ## Known limits
 
-- A pre-existing or competing metadata title makes the daemon back off for that pane until it closes. The snapshot does not expose title ownership, so an old autolabel title after restart is treated conservatively too. Before writing, we recheck the pane; herdr has no atomic compare-and-set, so a rename racing that final write is cleared on the next pass.
+- A competing metadata title from another source makes the daemon skip that pane for as long as the title is present; once it disappears the pane is labelled again. Our own titles from a previous daemon run look the same (the snapshot does not expose title ownership): they are cleared once, then relabelled on the next pass. Before writing, we recheck the pane; herdr has no atomic compare-and-set, so a rename racing that final write is cleared on the next pass.
 - Heuristics look at the first non-shell foreground process; pipelines label by their first command.
 - Coding-agent panes are always LLM-labelled (cached per fingerprint); with `provider = "none"` they fall back to `<agent> <branch|cwd>`.
 - Labels reflect the last 40 lines; a long-idle agent keeps its last label until the screen changes.
