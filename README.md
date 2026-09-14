@@ -31,7 +31,7 @@ Manual renames always win: a pane with a `herdr pane rename` label is never titl
 
 ## Config
 
-`$HERDR_PLUGIN_CONFIG_DIR/config.toml` (`herdr plugin config-dir andoroid.autolabel`); see `config.example.toml`. All keys optional.
+`$HERDR_PLUGIN_CONFIG_DIR/config.toml` (`herdr plugin config-dir andoroid.autolabel`); see `config.example.toml`. All keys optional. Unknown keys are ignored; invalid fields use defaults with a warning. Invalid TOML syntax rejects the whole file.
 
 | key | default | meaning |
 | --- | --- | --- |
@@ -44,6 +44,8 @@ Manual renames always win: a pane with a `herdr pane rename` label is never titl
 | `llm_global_per_min` | `6` | global LLM budget |
 | `allow` | `[]` | globs on `pane_id` / `workspace_id` / cwd; non-empty = only these |
 | `deny` | `[]` | globs; always win |
+
+Globs match the entire pane ID, workspace ID or cwd. `*` includes `/`; `?` matches one Unicode character. Brackets and backslashes are literal; deny takes precedence.
 
 ## Operating
 

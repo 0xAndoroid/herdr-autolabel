@@ -5,7 +5,7 @@ use std::path::Path;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(default, deny_unknown_fields)]
+#[serde(default)]
 pub struct Config {
     pub interval_secs: u64,
     pub provider: String,
@@ -36,7 +36,29 @@ impl Default for Config {
 
 impl Config {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let mut config: Config = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut values: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut config = Self::default();
+        macro_rules! read_fields {
+            ($($field:ident),+ $(,)?) => {$(
+                if let Some(value) = values.remove(stringify!($field)) {
+                    match value.try_into() {
+                        Ok(value) => config.$field = value,
+                        Err(e) => crate::logging::log_warn!("config {}: {e}; using default", stringify!($field)),
+                    }
+                }
+            )+};
+        }
+        read_fields!(
+            interval_secs,
+            provider,
+            model,
+            max_chars,
+            lines,
+            llm_per_pane_secs,
+            llm_global_per_min,
+            allow,
+            deny
+        );
         config.sanitize();
         Ok(config)
     }
@@ -51,10 +73,23 @@ impl Config {
     }
 
     fn sanitize(&mut self) {
-        self.interval_secs = self.interval_secs.max(2);
-        self.max_chars = self.max_chars.clamp(4, 80);
-        self.lines = self.lines.clamp(1, 200);
-        self.llm_global_per_min = self.llm_global_per_min.max(1);
+        let defaults = Self::default();
+        macro_rules! validate {
+            ($field:ident, $range:expr) => {
+                if !$range.contains(&self.$field) {
+                    crate::logging::log_warn!(
+                        "config {} out of range; using default",
+                        stringify!($field)
+                    );
+                    self.$field = defaults.$field;
+                }
+            };
+        }
+        validate!(interval_secs, 2..=86400);
+        validate!(max_chars, 4..=80);
+        validate!(lines, 1..=200);
+        validate!(llm_per_pane_secs, 15..=86400);
+        validate!(llm_global_per_min, 1..=6);
         self.provider = self.provider.trim().to_ascii_lowercase();
     }
 
@@ -117,8 +152,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_keys_are_errors() {
-        assert!(Config::parse("bogus = 1\n").is_err());
+    fn unknown_keys_are_ignored() {
+        let c = Config::parse("bogus = 1\nprovider = \"none\"\n").unwrap();
+        assert_eq!(c.provider, "none");
+    }
+
+    #[test]
+    fn invalid_fields_preserve_valid_settings() {
+        let c = Config::parse("provider = \"none\"\nmax_chars = \"bad\"\ninterval_secs = 0\nllm_per_pane_secs = 0\nllm_global_per_min = 100").unwrap();
+        assert_eq!(c.provider, "none");
+        assert_eq!(c.max_chars, 24);
+        assert_eq!(c.interval_secs, 10);
+        assert_eq!(c.llm_per_pane_secs, 15);
+        assert_eq!(c.llm_global_per_min, 6);
     }
 
     #[test]
