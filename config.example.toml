@@ -1,0 +1,32 @@
+# herdr-autolabel config — lives at $HERDR_PLUGIN_CONFIG_DIR/config.toml
+# (`herdr plugin config-dir andoroid.autolabel`). Every key is optional.
+
+# Seconds between passes over all panes.
+interval_secs = 10
+
+# LLM provider: "auto" (cerebras → anthropic → openai → none, by key presence),
+# "cerebras", "anthropic", "openai", or "none" (heuristics only).
+provider = "auto"
+
+# Model override for the selected provider. Defaults:
+#   cerebras  = "qwen-3.8-27b"
+#   anthropic = "claude-haiku-4-5"
+#   openai    = "gpt-5-mini"
+# model = "qwen-3.8-27b"
+
+# Hard cap on label length (characters).
+max_chars = 24
+
+# Lines of recent pane output inspected (and sent, scrubbed, to the LLM).
+lines = 40
+
+# Minimum seconds between LLM calls for the same pane.
+llm_per_pane_secs = 15
+
+# Global LLM budget, calls per minute (token bucket).
+llm_global_per_min = 6
+
+# Globs matched against pane_id ("w1:p2"), workspace_id ("w1") and cwd.
+# If `allow` is non-empty, only matching panes are labeled. `deny` always wins.
+allow = []
+deny = []
