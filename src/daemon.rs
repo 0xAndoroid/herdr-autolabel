@@ -77,6 +77,7 @@ pub enum Source {
     Unchanged,
     SkippedManual,
     SkippedFilter,
+    SkippedTitle,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -144,8 +145,8 @@ pub struct Daemon {
     last_fp: HashMap<String, u64>,
     /// Title we last reported per pane.
     applied: HashMap<String, String>,
-    /// Label we already re-applied once after seeing a mismatching snapshot title.
-    reapplied: HashMap<String, String>,
+    /// A different title owner was observed; leave the pane alone until it closes.
+    blocked: HashSet<String>,
     /// Panes whose title we cleared because of a manual label.
     cleared: HashSet<String>,
     started_at: String,
@@ -168,7 +169,7 @@ impl Daemon {
             cache: LabelCache::new(),
             last_fp: HashMap::new(),
             applied: HashMap::new(),
-            reapplied: HashMap::new(),
+            blocked: HashSet::new(),
             cleared: HashSet::new(),
             started_at: crate::logging::timestamp(),
             pass_count: 0,
@@ -240,7 +241,7 @@ impl Daemon {
         let alive: HashSet<String> = snapshot.panes.iter().map(|p| p.pane_id.clone()).collect();
         self.last_fp.retain(|k, _| alive.contains(k));
         self.applied.retain(|k, _| alive.contains(k));
-        self.reapplied.retain(|k, _| alive.contains(k));
+        self.blocked.retain(|k| alive.contains(k));
         self.cleared.retain(|k| alive.contains(k));
         self.limiter.retain_panes(&|k| alive.contains(k));
 
@@ -267,20 +268,9 @@ impl Daemon {
             applied,
         };
 
-        if !self
-            .config
-            .permits(&[&pane.pane_id, &pane.workspace_id, &cwd])
-        {
-            stats.skipped += 1;
-            self.clear_if_ours(pane)?;
-            return Ok(outcome(None, Source::SkippedFilter, false));
+        if let Some(source) = self.skip_pane(pane, stats)? {
+            return Ok(outcome(None, source, false));
         }
-        if pane.has_manual_label() {
-            stats.skipped += 1;
-            self.clear_if_ours(pane)?;
-            return Ok(outcome(None, Source::SkippedManual, false));
-        }
-        self.cleared.remove(&id);
 
         let procs: Vec<Proc> = match self.client.process_info(&id) {
             Ok(info) => info
@@ -344,15 +334,11 @@ impl Daemon {
 
         if !force && self.last_fp.get(&id) == Some(&fp) {
             stats.unchanged += 1;
-            // Our title vanished (server-side reset or another source won): re-apply once.
             if let Some(ours) = self.applied.get(&id).cloned()
-                && pane.title.as_deref() != Some(ours.as_str())
-                && self.reapplied.get(&id) != Some(&ours)
+                && pane.title.is_none()
             {
-                log_debug!("{id}: title {:?} != ours {ours:?}; re-applying", pane.title);
-                self.apply(&id, &ours, stats)?;
-                self.reapplied.insert(id.clone(), ours.clone());
-                return Ok(outcome(Some(ours), Source::Unchanged, true));
+                let applied = self.apply(&id, &ours, stats)?;
+                return Ok(outcome(Some(ours), Source::Unchanged, applied));
             }
             return Ok(outcome(
                 self.applied.get(&id).cloned(),
@@ -371,8 +357,8 @@ impl Daemon {
                         log_debug!("{id}: llm rate-limited; keeping previous label");
                         // Don't record the fingerprint so the next pass retries.
                         if !self.applied.contains_key(&id) {
-                            self.apply(&id, &fallback, stats)?;
-                            return Ok(outcome(Some(fallback), Source::RateLimited, true));
+                            let applied = self.apply(&id, &fallback, stats)?;
+                            return Ok(outcome(Some(fallback), Source::RateLimited, applied));
                         }
                         return Ok(outcome(
                             self.applied.get(&id).cloned(),
@@ -416,52 +402,83 @@ impl Daemon {
             }
         };
 
-        self.last_fp.insert(id.clone(), fp);
         if label.is_empty() {
             return Ok(outcome(None, source, false));
         }
         let changed = self.applied.get(&id) != Some(&label);
         if changed || force {
-            self.apply(&id, &label, stats)?;
-            self.reapplied.remove(&id);
-            return Ok(outcome(Some(label), source, true));
+            let applied = self.apply(&id, &label, stats)?;
+            if applied {
+                self.last_fp.insert(id.clone(), fp);
+            }
+            return Ok(outcome(Some(label), source, applied));
         }
+        self.last_fp.insert(id.clone(), fp);
         Ok(outcome(Some(label), source, false))
     }
 
-    fn apply(&mut self, id: &str, label: &str, stats: &mut PassStats) -> Result<(), herdr::Error> {
-        match self.client.set_title(id, label) {
-            Ok(()) => {
-                stats.labeled += 1;
-                self.total_applied += 1;
-                self.applied.insert(id.to_string(), label.to_string());
-                log_debug!("{id}: title ← {label:?}");
-                Ok(())
-            }
-            Err(herdr::Error::Connect(e)) => Err(herdr::Error::Connect(e)),
-            Err(e) => {
-                self.last_error = Some(e.to_string());
-                log_warn!("{id}: report_metadata failed: {e}");
-                Ok(())
-            }
+    fn skip_pane(
+        &mut self,
+        pane: &PaneInfo,
+        stats: &mut PassStats,
+    ) -> Result<Option<Source>, herdr::Error> {
+        let id = &pane.pane_id;
+        let source = if pane.has_manual_label() {
+            Some(Source::SkippedManual)
+        } else if !self
+            .config
+            .permits(&[id, &pane.workspace_id, pane.effective_cwd()])
+        {
+            Some(Source::SkippedFilter)
+        } else if self.blocked.contains(id)
+            || pane
+                .title
+                .as_ref()
+                .is_some_and(|title| !title.is_empty() && self.applied.get(id) != Some(title))
+        {
+            self.blocked.insert(id.clone());
+            Some(Source::SkippedTitle)
+        } else {
+            None
+        };
+        if source.is_some() {
+            stats.skipped += 1;
+            self.clear_if_ours(pane)?;
+        } else {
+            self.cleared.remove(id);
         }
+        Ok(source)
     }
 
-    /// Clears our title on a pane we must not label (manual rename / filtered), once.
+    fn apply(
+        &mut self,
+        id: &str,
+        label: &str,
+        stats: &mut PassStats,
+    ) -> Result<bool, herdr::Error> {
+        // An LLM call can outlive a rename or another source's title update.
+        let pane = self.client.pane(id)?;
+        if self.skip_pane(&pane, stats)?.is_some() {
+            return Ok(false);
+        }
+        self.client.set_title(id, label)?;
+        stats.labeled += 1;
+        self.total_applied += 1;
+        self.applied.insert(id.to_string(), label.to_string());
+        log_debug!("{id}: title ← {label:?}");
+        Ok(true)
+    }
+
+    /// Clears only our source, recording completion only after the server acknowledges it.
     fn clear_if_ours(&mut self, pane: &PaneInfo) -> Result<(), herdr::Error> {
         let id = &pane.pane_id;
-        let had_ours = self.applied.remove(id).is_some();
-        self.last_fp.remove(id);
-        self.reapplied.remove(id);
-        // A title we didn't set this run may still be ours from a previous daemon.
-        if had_ours || (pane.title.is_some() && !self.cleared.contains(id)) {
-            match self.client.clear_title(id) {
-                Ok(()) => log_debug!("{id}: cleared our title"),
-                Err(herdr::Error::Connect(e)) => return Err(herdr::Error::Connect(e)),
-                Err(e) => log_warn!("{id}: clear_title failed: {e}"),
-            }
+        if !self.cleared.contains(id) && (self.applied.contains_key(id) || pane.title.is_some()) {
+            self.client.clear_title(id)?;
+            self.cleared.insert(id.clone());
+            log_debug!("{id}: cleared our title");
         }
-        self.cleared.insert(id.clone());
+        self.applied.remove(id);
+        self.last_fp.remove(id);
         Ok(())
     }
 
@@ -507,6 +524,163 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mock_daemon(
+        name: &str,
+        replies: Vec<(&'static str, serde_json::Value)>,
+    ) -> (Daemon, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let socket = std::env::temp_dir().join(format!("hal-{name}-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let paths = Paths {
+            socket: socket.clone(),
+            state_dir: std::env::temp_dir(),
+            config_dir: std::env::temp_dir(),
+        };
+        let server = std::thread::spawn(move || {
+            for (method, response) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut line = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut line)
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["method"], method);
+                if method == "pane.report_metadata" {
+                    assert_eq!(request["params"]["source"], herdr::SOURCE);
+                }
+                let mut response = response;
+                response["id"] = request["id"].clone();
+                writeln!(stream, "{response}").unwrap();
+            }
+            std::fs::remove_file(socket).unwrap();
+        });
+        (Daemon::new(paths, Config::default(), None), server)
+    }
+
+    #[test]
+    fn manual_and_competing_titles_clear_once_and_never_reapply() {
+        for manual in [false, true] {
+            let (mut daemon, server) = mock_daemon(
+                if manual { "manual" } else { "competing" },
+                vec![("pane.report_metadata", json!({"result": {"type": "ok"}}))],
+            );
+            let mut pane = PaneInfo {
+                pane_id: "p1".into(),
+                title: Some("other title".into()),
+                ..Default::default()
+            };
+            if manual {
+                pane.label = Some("mine".into());
+            }
+            daemon.applied.insert("p1".into(), "ours".into());
+            let mut stats = PassStats::default();
+            assert!(
+                !daemon
+                    .handle_pane(&pane, false, &mut stats)
+                    .unwrap()
+                    .applied
+            );
+            assert!(!daemon.handle_pane(&pane, true, &mut stats).unwrap().applied);
+            if !manual {
+                pane.title = None;
+                assert_eq!(
+                    daemon.handle_pane(&pane, true, &mut stats).unwrap().source,
+                    Source::SkippedTitle
+                );
+            }
+            assert!(daemon.applied.is_empty());
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_clear_is_retried_until_acknowledged() {
+        let (mut daemon, server) = mock_daemon(
+            "clear-retry",
+            vec![
+                (
+                    "pane.report_metadata",
+                    json!({"error": {"code": "busy", "message": "retry"}}),
+                ),
+                ("pane.report_metadata", json!({"result": {"type": "ok"}})),
+            ],
+        );
+        let pane = PaneInfo {
+            pane_id: "p1".into(),
+            label: Some("mine".into()),
+            title: Some("ours".into()),
+            ..Default::default()
+        };
+        let mut stats = PassStats::default();
+        assert!(daemon.handle_pane(&pane, false, &mut stats).is_err());
+        assert!(daemon.handle_pane(&pane, false, &mut stats).is_ok());
+        assert!(daemon.handle_pane(&pane, false, &mut stats).is_ok());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn failed_apply_does_not_cache_fingerprint() {
+        let mut replies = Vec::new();
+        for fail in [true, false] {
+            replies.extend([
+                ("pane.process_info", json!({"result": {"process_info": {}}})),
+                ("pane.read", json!({"result": {"read": {"text": "ready"}}})),
+                ("pane.get", json!({"result": {"pane": {"pane_id": "p1"}}})),
+                (
+                    "pane.report_metadata",
+                    if fail {
+                        json!({"error": {"code": "busy"}})
+                    } else {
+                        json!({"result": {"type": "ok"}})
+                    },
+                ),
+            ]);
+        }
+        let (mut daemon, server) = mock_daemon("apply-retry", replies);
+        let pane = PaneInfo {
+            pane_id: "p1".into(),
+            ..Default::default()
+        };
+        let mut stats = PassStats::default();
+        assert!(daemon.handle_pane(&pane, false, &mut stats).is_err());
+        assert!(daemon.last_fp.is_empty());
+        assert!(
+            daemon
+                .handle_pane(&pane, false, &mut stats)
+                .unwrap()
+                .applied
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn rename_during_labeling_prevents_write() {
+        let (mut daemon, server) = mock_daemon(
+            "rename",
+            vec![
+                ("pane.process_info", json!({"result": {"process_info": {}}})),
+                ("pane.read", json!({"result": {"read": {}}})),
+                (
+                    "pane.get",
+                    json!({"result": {"pane": {"pane_id": "p1", "label": "mine"}}}),
+                ),
+            ],
+        );
+        let pane = PaneInfo {
+            pane_id: "p1".into(),
+            ..Default::default()
+        };
+        assert!(
+            !daemon
+                .handle_pane(&pane, false, &mut PassStats::default())
+                .unwrap()
+                .applied
+        );
+        assert!(daemon.last_fp.is_empty());
+        server.join().unwrap();
+    }
 
     #[test]
     fn cache_is_lru_bounded() {

@@ -61,7 +61,7 @@ macOS + Linux.
 
 ## Known limits
 
-- The metadata title is the newest across all sources, so another plugin/hook setting titles on the same pane can override ours; we re-apply once per label and then leave it.
+- A pre-existing or competing metadata title makes the daemon back off for that pane until it closes. The snapshot does not expose title ownership, so an old autolabel title after restart is treated conservatively too. Before writing, we recheck the pane; herdr has no atomic compare-and-set, so a rename racing that final write is cleared on the next pass.
 - Heuristics look at the first non-shell foreground process; pipelines label by their first command.
 - Coding-agent panes are always LLM-labelled (cached per fingerprint); with `provider = "none"` they fall back to `<agent> <branch|cwd>`.
 - Labels reflect the last 40 lines; a long-idle agent keeps its last label until the screen changes.

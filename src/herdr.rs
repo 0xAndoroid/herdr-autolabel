@@ -193,6 +193,10 @@ impl Client {
         self.call_payload("session.snapshot", json!({}), "snapshot")
     }
 
+    pub fn pane(&self, pane_id: &str) -> Result<PaneInfo, Error> {
+        self.call_payload("pane.get", json!({"pane_id": pane_id}), "pane")
+    }
+
     pub fn process_info(&self, pane_id: &str) -> Result<ProcessInfo, Error> {
         self.call_payload(
             "pane.process_info",
