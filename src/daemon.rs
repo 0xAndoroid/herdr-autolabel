@@ -146,7 +146,6 @@ pub struct Daemon {
     /// Title we last reported per pane.
     applied: HashMap<String, String>,
     /// A different title owner was observed; leave the pane alone until it closes.
-    blocked: HashSet<String>,
     /// Panes whose title we cleared because of a manual label.
     cleared: HashSet<String>,
     started_at: String,
@@ -170,7 +169,6 @@ impl Daemon {
             cache: LabelCache::new(),
             last_fp: HashMap::new(),
             applied: HashMap::new(),
-            blocked: HashSet::new(),
             cleared: HashSet::new(),
             started_at: crate::logging::timestamp(),
             pass_count: 0,
@@ -243,7 +241,6 @@ impl Daemon {
         let alive: HashSet<String> = snapshot.panes.iter().map(|p| p.pane_id.clone()).collect();
         self.last_fp.retain(|k, _| alive.contains(k));
         self.applied.retain(|k, _| alive.contains(k));
-        self.blocked.retain(|k| alive.contains(k));
         self.cleared.retain(|k| alive.contains(k));
 
         for pane in &snapshot.panes {
@@ -440,13 +437,14 @@ impl Daemon {
             .permits(&[id, &pane.workspace_id, pane.effective_cwd()])
         {
             Some(Source::SkippedFilter)
-        } else if self.blocked.contains(id)
-            || pane
-                .title
-                .as_ref()
-                .is_some_and(|title| !title.is_empty() && self.applied.get(id) != Some(title))
+        } else if pane
+            .title
+            .as_ref()
+            .is_some_and(|title| !title.is_empty() && self.applied.get(id) != Some(title))
         {
-            self.blocked.insert(id.clone());
+            // A title we did not apply: either ours from a previous daemon run (cleared
+            // once via `clear_if_ours`, after which the pane is labelled again) or another
+            // source's, which keeps winning for as long as it is present.
             Some(Source::SkippedTitle)
         } else {
             None
@@ -573,12 +571,21 @@ mod tests {
     }
 
     #[test]
-    fn manual_and_competing_titles_clear_once_and_never_reapply() {
+    fn manual_and_competing_titles_clear_once_and_relabel_when_title_vanishes() {
         for manual in [false, true] {
-            let (mut daemon, server) = mock_daemon(
-                if manual { "manual" } else { "competing" },
-                vec![("pane.report_metadata", json!({"result": {"type": "ok"}}))],
-            );
+            let mut replies = vec![("pane.report_metadata", json!({"result": {"type": "ok"}}))];
+            if !manual {
+                // Once the competing title is gone (e.g. it was ours from a previous daemon
+                // run), the pane is labelled again.
+                replies.extend([
+                    ("pane.process_info", json!({"result": {"process_info": {}}})),
+                    ("pane.read", json!({"result": {"read": {"text": "ready"}}})),
+                    ("pane.get", json!({"result": {"pane": {"pane_id": "p1"}}})),
+                    ("pane.report_metadata", json!({"result": {"type": "ok"}})),
+                ]);
+            }
+            let (mut daemon, server) =
+                mock_daemon(if manual { "manual" } else { "competing" }, replies);
             let mut pane = PaneInfo {
                 pane_id: "p1".into(),
                 title: Some("other title".into()),
@@ -596,14 +603,14 @@ mod tests {
                     .applied
             );
             assert!(!daemon.handle_pane(&pane, true, &mut stats).unwrap().applied);
+            assert!(daemon.applied.is_empty());
             if !manual {
                 pane.title = None;
-                assert_eq!(
-                    daemon.handle_pane(&pane, true, &mut stats).unwrap().source,
-                    Source::SkippedTitle
-                );
+                let outcome = daemon.handle_pane(&pane, true, &mut stats).unwrap();
+                assert_ne!(outcome.source, Source::SkippedTitle);
+                assert!(outcome.applied);
+                assert!(daemon.applied.contains_key("p1"));
             }
-            assert!(daemon.applied.is_empty());
             server.join().unwrap();
         }
     }
