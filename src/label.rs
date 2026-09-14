@@ -24,9 +24,11 @@ pub fn truncate_words(s: &str, max_chars: usize) -> String {
         return s.to_string();
     }
     let hard: String = s.chars().take(max_chars).collect();
+    if s.chars().nth(max_chars).is_some_and(char::is_whitespace) {
+        return hard.trim_end().to_string();
+    }
     match hard.rfind(' ') {
-        // Keep at least half the budget so we don't collapse to a lone short word.
-        Some(idx) if idx >= max_chars / 2 => hard[..idx].trim_end().to_string(),
+        Some(idx) if idx > 0 => hard[..idx].trim_end().to_string(),
         _ => hard.trim_end().to_string(),
     }
 }
@@ -66,11 +68,14 @@ mod tests {
     fn hard_cut_when_no_boundary() {
         let out = finalize("supercalifragilisticexpialidocious", 3, 10);
         assert_eq!(out, "supercalif");
-        // A boundary too early falls back to a hard cut.
-        assert_eq!(
-            truncate_words("a bcdefghijklmnopqrstuvwxyz", 10),
-            "a bcdefghi"
-        );
+        assert_eq!(truncate_words("a bcdefghijklmnopqrstuvwxyz", 10), "a");
+    }
+
+    #[test]
+    fn complete_words_and_unicode_boundaries() {
+        assert_eq!(truncate_words("cargo build more", 11), "cargo build");
+        assert_eq!(truncate_words("nvim extraordinarily-long.rs", 24), "nvim");
+        assert_eq!(truncate_words("界界 abcdefghijkl", 6), "界界");
     }
 
     #[test]
