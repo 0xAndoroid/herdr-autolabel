@@ -236,10 +236,13 @@ impl Provider {
                 "system": SYSTEM_PROMPT,
                 "messages": [{"role": "user", "content": user}],
             }),
+            // Cerebras' qwen models reason by default and would spend the whole token budget
+            // on it; `reasoning_effort: none` turns that off.
             Kind::Cerebras => json!({
                 "model": self.model,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0,
+                "reasoning_effort": "none",
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user},
@@ -249,6 +252,7 @@ impl Provider {
             Kind::OpenAi => json!({
                 "model": self.model,
                 "max_completion_tokens": MAX_TOKENS.max(64),
+                "reasoning_effort": "minimal",
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user},

@@ -178,20 +178,36 @@ impl Client {
             .ok_or_else(|| Error::Protocol("missing result".into()))
     }
 
+    /// Calls `method` and unwraps the typed payload: herdr wraps results as
+    /// `{"type": "<variant>", "<key>": {...}}`; older/other shapes are accepted as-is.
+    fn call_payload<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Value,
+        key: &str,
+    ) -> Result<T, Error> {
+        let mut result = self.call(method, params)?;
+        let payload = match result.get_mut(key) {
+            Some(inner) => inner.take(),
+            None => result,
+        };
+        Ok(serde_json::from_value(payload)?)
+    }
+
     pub fn snapshot(&self) -> Result<Snapshot, Error> {
-        Ok(serde_json::from_value(
-            self.call("session.snapshot", json!({}))?,
-        )?)
+        self.call_payload("session.snapshot", json!({}), "snapshot")
     }
 
     pub fn process_info(&self, pane_id: &str) -> Result<ProcessInfo, Error> {
-        Ok(serde_json::from_value(
-            self.call("pane.process_info", json!({"pane_id": pane_id}))?,
-        )?)
+        self.call_payload(
+            "pane.process_info",
+            json!({"pane_id": pane_id}),
+            "process_info",
+        )
     }
 
     pub fn read_recent(&self, pane_id: &str, lines: u32) -> Result<ReadResult, Error> {
-        Ok(serde_json::from_value(self.call(
+        self.call_payload(
             "pane.read",
             json!({
                 "pane_id": pane_id,
@@ -200,7 +216,8 @@ impl Client {
                 "format": "text",
                 "strip_ansi": true,
             }),
-        )?)?)
+            "read",
+        )
     }
 
     pub fn set_title(&self, pane_id: &str, title: &str) -> Result<(), Error> {
@@ -265,10 +282,11 @@ mod tests {
         let s = sock("snap");
         serve_once(s.clone(), |req| {
             assert_eq!(req["method"], "session.snapshot");
-            json!({"id": req["id"], "result": {"type": "session_snapshot", "unknown": 1,
+            json!({"id": req["id"], "result": {"type": "session_snapshot", "snapshot": {
+                "unknown": 1,
                 "panes": [{"pane_id": "w1:p1", "workspace_id": "w1", "tab_id": "t1",
                     "terminal_id": "term-1", "focused": true, "agent_status": "idle",
-                    "revision": 3, "cwd": "/x", "label": null, "extra_field": [1,2]}]}})
+                    "revision": 3, "cwd": "/x", "label": null, "extra_field": [1,2]}]}}})
             .to_string()
         });
         let c = Client::new(&s);

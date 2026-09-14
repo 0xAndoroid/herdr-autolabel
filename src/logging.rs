@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 static DEBUG: AtomicBool = AtomicBool::new(false);
+static TO_STDERR: AtomicBool = AtomicBool::new(false);
 
 pub fn init_from_env() {
     let level = std::env::var("AUTOLABEL_LOG").unwrap_or_default();
@@ -13,12 +14,21 @@ pub fn init_from_env() {
     );
 }
 
+/// Route log lines to stderr so a command's stdout stays pure JSON.
+pub fn use_stderr() {
+    TO_STDERR.store(true, Ordering::Relaxed);
+}
+
 pub fn debug_enabled() -> bool {
     DEBUG.load(Ordering::Relaxed)
 }
 
 pub fn emit(level: &str, msg: &str) {
-    println!("{} {level:<5} {msg}", timestamp());
+    if TO_STDERR.load(Ordering::Relaxed) {
+        eprintln!("{} {level:<5} {msg}", timestamp());
+    } else {
+        println!("{} {level:<5} {msg}", timestamp());
+    }
 }
 
 macro_rules! log_info {

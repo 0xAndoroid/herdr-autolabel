@@ -72,6 +72,9 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if args.command != "daemon" {
+        logging::use_stderr();
+    }
     let paths = Paths::resolve(args.socket.clone());
     let code = match args.command.as_str() {
         "start" => cmd_start(&paths),
