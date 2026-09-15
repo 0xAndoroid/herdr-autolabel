@@ -214,6 +214,14 @@ pub fn basename(p: &str) -> String {
         .unwrap_or_else(|| p.to_string())
 }
 
+pub fn directory_name(cwd: &str) -> String {
+    if Path::new(cwd) == crate::herdr::home_dir() {
+        "home".into()
+    } else {
+        basename(cwd.trim_end_matches('/'))
+    }
+}
+
 /// Picks the process that best describes the pane from a foreground process group: the first
 /// non-shell entry, or `None` when the group is empty or only shells (an idle prompt).
 /// The command typed at the prompt: the foreground process group's `leader`, else the first
@@ -257,7 +265,7 @@ pub fn project(cwd: &str) -> Option<String> {
         return None;
     }
     crate::git::repo_basename(Path::new(cwd))
-        .or_else(|| Some(basename(cwd)))
+        .or_else(|| Some(directory_name(cwd)))
         .map(|d| project_name(&d).to_string())
         .filter(|s| !s.is_empty())
 }
@@ -266,7 +274,7 @@ fn idle_label(facts: &PaneFacts) -> String {
     match &facts.branch {
         Some(b) if !b.is_empty() && !is_default_branch(b) => b.clone(),
         _ => {
-            let base = basename(facts.cwd.trim_end_matches('/'));
+            let base = directory_name(&facts.cwd);
             if base.is_empty() {
                 "shell".into()
             } else {
@@ -560,6 +568,27 @@ mod tests {
         assert_eq!(project(""), None);
         assert_eq!(label_of(&["zsh"], "/x/jolt.keccak", Some("main")), "jolt");
         assert_eq!(label_of(&["zsh"], "/x/.dotfiles", None), ".dotfiles");
+    }
+
+    #[test]
+    fn home_directory_is_named_home() {
+        let home = crate::herdr::home_dir();
+        let cwd = home.to_str().unwrap();
+        for cwd in [cwd.to_string(), format!("{cwd}/")] {
+            assert_eq!(directory_name(&cwd), "home");
+            assert_eq!(label_of(&["zsh"], &cwd, None), "home");
+            assert_eq!(project(&cwd).as_deref(), Some("home"));
+        }
+        let child = home.join("Downloads");
+        assert_eq!(
+            label_of(&["zsh"], child.to_str().unwrap(), None),
+            "Downloads"
+        );
+        let namesake = home.join("dev").join(home.file_name().unwrap());
+        assert_eq!(
+            label_of(&["zsh"], namesake.to_str().unwrap(), None),
+            project_name(&basename(cwd))
+        );
     }
 
     #[test]

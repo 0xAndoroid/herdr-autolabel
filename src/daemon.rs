@@ -486,7 +486,7 @@ impl Daemon {
                         self.total_llm_calls += 1;
                         let fg_cmdline = fg.as_ref().map(|p| p.argv.join(" "));
                         let child_cmdline = child.as_ref().map(|p| p.argv.join(" "));
-                        let cwd_base = heuristics::basename(cwd.trim_end_matches('/'));
+                        let cwd_base = heuristics::directory_name(&cwd);
                         let ctx = llm::Context {
                             agent: facts.agent.as_deref(),
                             agent_status: facts.agent.as_ref().map(|_| agent_status.as_str()),
