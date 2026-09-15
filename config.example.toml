@@ -2,7 +2,7 @@
 # (`herdr plugin config-dir andoroid.autolabel`). Every key is optional.
 
 # Seconds between passes over all panes.
-interval_secs = 10
+interval_secs = 1
 
 # LLM provider: "auto" (cerebras, else openai, else none, by key presence),
 # "cerebras", "anthropic", "openai", or "none" (heuristics only).

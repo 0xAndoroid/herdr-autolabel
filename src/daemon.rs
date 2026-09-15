@@ -1041,6 +1041,45 @@ mod tests {
         finish(&daemon, server);
     }
 
+    #[test]
+    fn matching_context_reuses_label_even_when_different_contexts_name_it_the_same() {
+        let mut replies = labelled_pane("p1");
+        replies.extend((0..4).flat_map(|_| unchanged_pane()));
+        let (mut daemon, server) = mock_daemon("context-cache", replies);
+        let label = "herdr: fix labels";
+        for title in ["Task A", "Task B"] {
+            let fp = Fingerprint {
+                agent: Some("claude".into()),
+                title: Some(title.into()),
+                ..Default::default()
+            }
+            .hash();
+            daemon.cache.insert(fp, label.into());
+        }
+        let mut pane = PaneInfo {
+            pane_id: "p1".into(),
+            agent: Some("claude".into()),
+            ..Default::default()
+        };
+        let mut stats = PassStats::default();
+        for (title, source) in [
+            ("Task A", Source::Cache),
+            ("Task A", Source::Unchanged),
+            ("Task B", Source::Cache),
+            ("Task B", Source::Unchanged),
+            ("Task A", Source::Cache),
+        ] {
+            pane.terminal_title_stripped = Some(title.into());
+            let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
+            assert_eq!(outcome.source, source);
+            assert_eq!(outcome.label.as_deref(), Some(label));
+            pane.title = outcome.label;
+        }
+        assert_eq!(stats.labeled, 1);
+        assert_eq!(stats.llm_calls, 0);
+        finish(&daemon, server);
+    }
+
     fn ws(id: &str, label: &str, focused: bool) -> serde_json::Value {
         json!({"workspace_id": id, "label": label, "focused": focused, "pane_count": 1})
     }

@@ -25,7 +25,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            interval_secs: 10,
+            interval_secs: 1,
             provider: "auto".into(),
             model: None,
             max_chars: 25,
@@ -93,7 +93,7 @@ impl Config {
                 }
             };
         }
-        validate!(interval_secs, 2..=86400);
+        validate!(interval_secs, 1..=86400);
         validate!(max_chars, 4..=80);
         validate!(lines, 1..=200);
         validate!(llm_per_pane_secs, 15..=86400);
@@ -148,7 +148,7 @@ mod tests {
     fn empty_file_yields_defaults() {
         let c = Config::parse("").unwrap();
         assert_eq!(c, Config::default());
-        assert_eq!(c.interval_secs, 10);
+        assert_eq!(c.interval_secs, 1);
         assert_eq!(c.provider, "auto");
         assert_eq!(c.model, None);
         assert_eq!(c.max_chars, 25);
@@ -187,7 +187,7 @@ mod tests {
         let c = Config::parse("provider = \"none\"\nmax_chars = \"bad\"\ninterval_secs = 0\nllm_per_pane_secs = 0\nllm_global_per_min = 100").unwrap();
         assert_eq!(c.provider, "none");
         assert_eq!(c.max_chars, 25);
-        assert_eq!(c.interval_secs, 10);
+        assert_eq!(c.interval_secs, 1);
         assert_eq!(c.llm_per_pane_secs, 15);
         assert_eq!(c.llm_global_per_min, 6);
     }

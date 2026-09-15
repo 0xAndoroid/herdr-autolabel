@@ -1,6 +1,6 @@
 # herdr-autolabel
 
-herdr plugin whose daemon labels every **pane** with a terse 1–2 word title describing what is happening in it — `feat/daemon`, `cargo build`, `nvim foo.rs`, `ssh host`, `review PR 1283` — and names every **space** (the workspace rows in herdr's sidebar) `<project>: <activity>` after its panes — `pika: watching CI run`, `jolt: cargo build`. Both follow activity with ≈10–20 s lag.
+herdr plugin whose daemon labels every **pane** with a terse 1–2 word title describing what is happening in it — `feat/daemon`, `cargo build`, `nvim foo.rs`, `ssh host`, `review PR 1283` — and names every **space** (the workspace rows in herdr's sidebar) `<project>: <activity>` after its panes — `pika: watching CI run`, `jolt: cargo build`. Polls every second; known commands normally update pane titles within ≈1 s and space names within ≈2 s. LLM calls and rate limits can add delay.
 
 ## Install
 
@@ -34,7 +34,7 @@ Each space gets **one** name of at most `max_chars` (25) characters, taken from 
 
 Manually renamed panes contribute their manual name as the activity (`pika: billing rewrite`); panes titled by another source contribute that title as a whole name. Filtered panes (`allow`/`deny`) contribute nothing, and neither does a pane still waiting for its LLM name (rate-limited, failed, or `provider = "none"`; its own title is the `<agent> <branch|cwd>` stand-in): a space whose only agent pane has no name yet keeps herdr's default, the folder name. Spaces never call the LLM.
 
-**Hysteresis:** the first label is applied at once; afterwards a new label must be derived on 2 consecutive passes (≈20 s) before the space is renamed, so a `cargo build` in one pane does not flip the space. The `relabel` action (`once --force`) bypasses the window.
+**Hysteresis:** the first label is applied at once; afterwards a new label must be derived on 2 consecutive passes (≈1–2 s with the default interval) before the space is renamed, so commands that disappear before the second pass do not rename it. The `relabel` action (`once --force`) bypasses the window.
 
 **Ownership:** herdr has no display-only title for workspaces (only custom `$tokens`, which need a sidebar layout change), so spaces are renamed with `workspace.rename` — the same name `herdr workspace rename` sets — under these rules:
 
@@ -51,6 +51,8 @@ Sidebar space rows show `workspace` + `branch` by default, so the branch line is
 
 ## Rate limits & privacy
 
+Polling checks for changed context; it does not call the LLM on a timer. Unchanged fingerprints reuse the previous result, and returning to a cached fingerprint reuses its label even if another context produced the same name. Cache misses are eligible immediately, subject to the rate limits below.
+
 - Per pane ≥ `llm_per_pane_secs` (15 s) between calls; global rolling 60-second window `llm_global_per_min` (6/min); call timestamps shared through a locked state file across sockets, one-shot runs and restarts; labels cached by fingerprint (LRU 256). Unchanged panes cost one `process_info` call (fingerprint = foreground command + cwd + branch + agent + idle/working + the agent's terminal title; for Claude, Codex and Pi panes your last prompt replaces command, state and title, and the transcript is re-read only when it grew). Screen text never enters the fingerprint and is read only for a pane about to be sent to the LLM, so an LLM call happens only when a new command starts, an agent flips between working and idle, or you send Claude a new prompt. Spaces never call the LLM: they reuse pane labels.
 - Only the last 40 visible rows (≤300 chars each) and, for Claude, Codex and Pi panes, the first 300 characters each of your first and last prompts plus the agent's terminal title leave the machine, after scrubbing: `key=value` secrets (token/api_key/secret/password/authorization/cookie), `Bearer …`, `sk-…`, `sk-ant-…`, `ghp_…`, `github_pat_…`, `xox?-…`, `AKIA…`, JWTs, private-key headers and any opaque 40+ char run → `[redacted]`. Pure-hex 40-character Git SHAs are preserved unless assigned to a secret key. Process arguments, agent metadata, cwd basename and branch are scrubbed too.
 
@@ -60,7 +62,7 @@ Sidebar space rows show `workspace` + `branch` by default, so the branch line is
 
 | key | default | meaning |
 | --- | --- | --- |
-| `interval_secs` | `10` | seconds between passes |
+| `interval_secs` | `1` | seconds between passes; minimum 1 |
 | `label_panes` | `true` | write pane titles (pane borders) |
 | `label_spaces` | `true` | rename sidebar spaces after their panes |
 | `provider` | `"auto"` | `auto` / `cerebras` / `anthropic` / `openai` / `none` |
