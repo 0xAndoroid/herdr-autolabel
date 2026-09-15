@@ -183,6 +183,9 @@ pub fn default_names<'a>(
     };
     for cwd in cwds.filter(|c| !c.is_empty()) {
         let path = Path::new(cwd.trim_end_matches('/'));
+        if path == crate::herdr::home_dir() {
+            push(Some("~".into()));
+        }
         push(path.file_name().map(|n| n.to_string_lossy().into_owned()));
         push(crate::git::repo_basename(path));
     }
@@ -447,6 +450,24 @@ mod tests {
             classify("crates", Some(&released), &defaults),
             Ownership::Default
         );
+    }
+
+    #[test]
+    fn home_alias_is_a_default_workspace_name() {
+        let home = crate::herdr::home_dir();
+        let defaults = default_names([home.to_str().unwrap()].into_iter(), None, None);
+        for applied in [Some("home".into()), None] {
+            let state = SpaceState {
+                original: "dev".into(),
+                applied,
+                pending: None,
+            };
+            assert_eq!(classify("~", Some(&state), &defaults), Ownership::Default);
+            assert_eq!(
+                classify("my project", Some(&state), &defaults),
+                Ownership::Manual
+            );
+        }
     }
 
     #[test]
