@@ -325,10 +325,10 @@ mod tests {
 
     #[test]
     fn whole_label_is_capped_at_max_chars() {
-        let panes = [pane("delegating keccak PR review", true, true, Some("shop"))];
+        let panes = [pane("delegating keccak PR review", true, true, Some("web"))];
         assert_eq!(
             aggregate(&panes, None, 22).as_deref(),
-            Some("shop: delegating keccak")
+            Some("web: delegating keccak")
         );
         // A project that leaves no room for the activity's first word stands alone.
         let panes = [pane(

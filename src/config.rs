@@ -10,6 +10,8 @@ pub struct Config {
     pub interval_secs: u64,
     pub provider: String,
     pub model: Option<String>,
+    /// System prompt for the LLM; replaces the built-in text.
+    pub prompt: Option<String>,
     pub max_chars: usize,
     pub lines: u32,
     pub llm_per_pane_secs: u64,
@@ -28,6 +30,7 @@ impl Default for Config {
             interval_secs: 1,
             provider: "auto".into(),
             model: None,
+            prompt: None,
             max_chars: 25,
             lines: 40,
             llm_per_pane_secs: 15,
@@ -58,6 +61,7 @@ impl Config {
             interval_secs,
             provider,
             model,
+            prompt,
             max_chars,
             lines,
             llm_per_pane_secs,
@@ -174,6 +178,12 @@ mod tests {
         let c = Config::parse("label_panes = false\nlabel_spaces = \"yes\"\n").unwrap();
         assert!(!c.label_panes);
         assert!(c.label_spaces, "invalid value keeps the default");
+    }
+
+    #[test]
+    fn prompt_is_read() {
+        let c = Config::parse("prompt = \"\"\"name\nit\"\"\"\n").unwrap();
+        assert_eq!(c.prompt.as_deref(), Some("name\nit"));
     }
 
     #[test]

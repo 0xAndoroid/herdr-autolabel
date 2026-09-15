@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::label;
 use crate::scrub;
 
-pub const SYSTEM_PROMPT: &str = "You name terminal panes for a sidebar. Reply with ONLY the name: at most the number of characters given, no quotes, no trailing punctuation, no explanation. Shape: '<project>: <task>'. <project> is a short form of the project name ('herdr' for herdr-autolabel); a repository name always stays, leave it out only for a home or scratch folder (dev, Downloads, dotfiles). <task> is a 1–3 word phrase. When a 'user's request' line is present (the user's last prompt to a coding agent, or the agent's summary of it), <task> MUST paraphrase that request and nothing else: not the file the agent has open, not the command it is running right now. 'session topic' and 'session's first request' say what the whole session is about and serve <project> only: when they, the branch or the command name an app or sub-project inside the repository, that is the <project> ('api: switch to fable' for the api app in the shop repository); they never shape <task>. Otherwise name what is being done, preferring concrete nouns: PR numbers ('review PR 1283'), branch names, file names, commands. For a shell command, keep the argument that tells this run apart (the app, service, target or file) and say what runs under it: 'api docker logs' for `shop dev --app api` running `docker logs`, never the bare tool.";
+const DEFAULT_PROMPT: &str = "You name terminal panes for a sidebar. Reply with ONLY the name: at most the number of characters given, no quotes, no trailing punctuation, no explanation. Shape: '<project>: <task>'. <project> is a short form of the project name ('herdr' for herdr-autolabel); a repository name always stays, leave it out only for a home or scratch folder (dev, Downloads, dotfiles). <task> is a 1–3 word phrase. When a 'user's request' line is present (the user's last prompt to a coding agent, or the agent's summary of it), <task> MUST paraphrase that request and nothing else: not the file the agent has open, not the command it is running right now. 'session topic' and 'session's first request' say what the whole session is about and serve <project> only: when they, the branch or the command name an app or sub-project inside the repository, that is the <project> ('api: switch to fable' for the api app in the shop repository); they never shape <task>. Otherwise name what is being done, preferring concrete nouns: PR numbers ('review PR 1283'), branch names, file names, commands. For a shell command, keep the argument that tells this run apart (the app, service, target or file) and say what runs under it: 'api docker logs' for `shop dev --app api` running `docker logs`, never the bare tool.";
 
 const TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_TOKENS: u32 = 40;
@@ -75,6 +75,8 @@ pub struct Provider {
     pub kind: Kind,
     pub model: String,
     key: String,
+    /// System prompt: the config's `prompt`, else `DEFAULT_PROMPT`.
+    prompt: String,
 }
 
 impl fmt::Display for Provider {
@@ -142,6 +144,11 @@ pub fn select(config: &Config) -> Result<Option<Provider>, String> {
             .filter(|m| !m.trim().is_empty())
             .unwrap_or_else(|| kind.default_model().to_string()),
         key,
+        prompt: config
+            .prompt
+            .clone()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_PROMPT.to_string()),
     };
     match config.provider.as_str() {
         "none" | "off" | "disabled" => Ok(None),
@@ -285,7 +292,7 @@ impl Provider {
                 "model": self.model,
                 "max_tokens": MAX_TOKENS,
                 "temperature": 0,
-                "system": SYSTEM_PROMPT,
+                "system": self.prompt,
                 "messages": [{"role": "user", "content": user}],
             }),
             // Cerebras' qwen models reason by default and would spend the whole token budget
@@ -296,7 +303,7 @@ impl Provider {
                 "temperature": 0,
                 "reasoning_effort": if retry { "low" } else { "none" },
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self.prompt},
                     {"role": "user", "content": user},
                 ],
             }),
@@ -307,7 +314,7 @@ impl Provider {
                 "max_completion_tokens": OPENAI_MAX_COMPLETION_TOKENS,
                 "reasoning_effort": "medium",
                 "messages": [
-                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "system", "content": self.prompt},
                     {"role": "user", "content": user},
                 ],
             }),
@@ -537,6 +544,7 @@ mod tests {
             kind: Kind::Anthropic,
             model: "m".into(),
             key: "k".into(),
+            prompt: DEFAULT_PROMPT.into(),
         };
         let v = json!({"content": [{"type": "text", "text": "hi"}]});
         assert_eq!(p.extract(&v).as_deref(), Some("hi"));
@@ -544,6 +552,7 @@ mod tests {
             kind: Kind::Cerebras,
             model: "m".into(),
             key: "k".into(),
+            prompt: DEFAULT_PROMPT.into(),
         };
         let v = json!({"choices": [{"message": {"role": "assistant", "content": "yo"}}]});
         assert_eq!(p.extract(&v).as_deref(), Some("yo"));
@@ -556,6 +565,7 @@ mod tests {
             kind: Kind::Cerebras,
             model: "m".into(),
             key: "k".into(),
+            prompt: DEFAULT_PROMPT.into(),
         };
         let first = p.request_body_with("ctx", false);
         assert_eq!(first["reasoning_effort"], "none");
@@ -572,11 +582,24 @@ mod tests {
             kind: Kind::OpenAi,
             model: "m".into(),
             key: "k".into(),
+            prompt: DEFAULT_PROMPT.into(),
         };
         let body = p.request_body_with("ctx", false);
         assert_eq!(body["reasoning_effort"], "medium");
         assert_eq!(body["max_completion_tokens"], OPENAI_MAX_COMPLETION_TOKENS);
         assert!(body.get("max_tokens").is_none());
         assert_eq!(p.timeout(), OPENAI_TIMEOUT);
+    }
+
+    #[test]
+    fn config_prompt_replaces_the_system_prompt() {
+        let p = Provider {
+            kind: Kind::Cerebras,
+            model: "m".into(),
+            key: "k".into(),
+            prompt: "name it".into(),
+        };
+        let body = p.request_body_with("ctx", false);
+        assert_eq!(body["messages"][0]["content"], "name it");
     }
 }

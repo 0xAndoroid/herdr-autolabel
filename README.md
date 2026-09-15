@@ -49,6 +49,8 @@ Sidebar space rows show `workspace` + `branch` by default, so the branch line is
 
 `provider = "auto"` picks the first with a key: **cerebras** (`qwen-3.8-27b`), else **openai** (`gpt-5.6-luna`), else none; `provider = "anthropic"` (`claude-haiku-4-5`) is available by name. Keys come from the environment or `~/.keysrc` (`export CEREBRAS_API_KEY=…` lines). Cerebras and Anthropic: 40 output tokens, temperature 0, reasoning off, 8 s timeout. OpenAI: `reasoning_effort` medium with a 2048-token completion budget for the reasoning plus the name, 30 s timeout.
 
+The system prompt is the `prompt` config key; the built-in text is in `config.example.toml`. Put project-specific examples (your app and repository names) there rather than in the source.
+
 ## Rate limits & privacy
 
 Polling checks for changed context; it does not call the LLM on a timer. Unchanged fingerprints reuse the previous result, and returning to a cached fingerprint reuses its label even if another context produced the same name. Cache misses are eligible immediately, subject to the rate limits below.
@@ -67,6 +69,7 @@ Polling checks for changed context; it does not call the LLM on a timer. Unchang
 | `label_spaces` | `true` | rename sidebar spaces after their panes |
 | `provider` | `"auto"` | `auto` / `cerebras` / `anthropic` / `openai` / `none` |
 | `model` | provider default | model override |
+| `prompt` | built-in | system prompt for the LLM; replaces the built-in text |
 | `max_chars` | `25` | label length cap (cut at a word boundary): pane titles, and space names as a whole |
 | `lines` | `40` | screen rows sent to the LLM |
 | `llm_per_pane_secs` | `15` | min spacing between LLM calls per pane |
