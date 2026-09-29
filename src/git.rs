@@ -64,6 +64,8 @@ fn read_head(git_dir: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
