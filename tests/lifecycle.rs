@@ -114,3 +114,20 @@ fn three_connection_failures_exit_and_reused_pid_is_not_signaled() {
         "not running"
     );
 }
+
+#[test]
+fn malformed_config_is_fatal() {
+    let session = Session::new("malformed");
+    fs::write(
+        session.root.join("config.toml"),
+        "provider = \"none\"\ndeny = [\"*\"\n",
+    )
+    .unwrap();
+    for verb in ["status", "once", "daemon", "start"] {
+        let output = session.command(verb).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{verb} ignored a malformed config"
+        );
+    }
+}

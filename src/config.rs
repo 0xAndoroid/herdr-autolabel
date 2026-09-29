@@ -209,6 +209,18 @@ mod tests {
     }
 
     #[test]
+    fn malformed_file_is_an_error() {
+        let path = std::env::temp_dir().join(format!(
+            "herdr-autolabel-malformed-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(&path, "provider = \"none\"\ndeny = [\"*\"\n").unwrap();
+        let result = Config::load(&path);
+        std::fs::remove_file(&path).unwrap();
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn allow_deny_globs() {
         let c = Config::parse("allow = [\"w1*\", \"*/dev/*\"]\ndeny = [\"w1:p3\"]\n").unwrap();
         assert!(c.permits(&["w1:p1", "w1", "/Users/me/dev/x"]));

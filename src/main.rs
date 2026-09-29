@@ -95,14 +95,10 @@ fn main() {
     std::process::exit(code);
 }
 
-fn load_config(paths: &Paths) -> config::Config {
-    match config::Config::load(&paths.config_file()) {
-        Ok(c) => c,
-        Err(e) => {
-            logging::log_warn!("config error ({e}); using defaults");
-            config::Config::default()
-        }
-    }
+fn load_config(paths: &Paths) -> Option<config::Config> {
+    config::Config::load(&paths.config_file())
+        .inspect_err(|e| eprintln!("config error: {e}"))
+        .ok()
 }
 
 fn select_provider(config: &config::Config) -> Option<llm::Provider> {
@@ -196,14 +192,14 @@ fn remove_pidfile(paths: &Paths) {
     let _ = std::fs::remove_file(paths.pidfile());
 }
 
-fn status_json(paths: &Paths) -> serde_json::Value {
+fn status_json(paths: &Paths) -> Option<serde_json::Value> {
     let pid = running_pid(paths);
     let last = std::fs::read_to_string(paths.status_file())
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let config = load_config(paths);
+    let config = load_config(paths)?;
     let provider = select_provider(&config);
-    json!({
+    Some(json!({
         "running": pid.is_some(),
         "pid": pid,
         "socket": paths.socket,
@@ -213,13 +209,16 @@ fn status_json(paths: &Paths) -> serde_json::Value {
         "provider": provider.as_ref().map_or("none", |p| p.kind.name()),
         "model": provider.as_ref().map(|p| p.model.clone()),
         "last_pass": last,
-    })
+    }))
 }
 
 fn cmd_start(paths: &Paths) -> i32 {
     if let Some(pid) = running_pid(paths) {
         logging::log_info!("daemon already running (pid {pid})");
-        println!("{}", status_json(paths));
+        let Some(status) = status_json(paths) else {
+            return 1;
+        };
+        println!("{status}");
         return 0;
     }
     if let Err(e) = std::fs::create_dir_all(&paths.state_dir) {
@@ -285,7 +284,10 @@ fn cmd_start(paths: &Paths) -> i32 {
         return 1;
     };
     logging::log_info!("started daemon pid {pid}, log {}", log_path.display());
-    println!("{}", status_json(paths));
+    let Some(status) = status_json(paths) else {
+        return 1;
+    };
+    println!("{status}");
     0
 }
 
@@ -294,6 +296,9 @@ extern "C" fn on_term(_sig: libc::c_int) {
 }
 
 fn cmd_daemon(paths: &Paths) -> i32 {
+    let Some(config) = load_config(paths) else {
+        return 1;
+    };
     if let Err(e) = std::fs::create_dir_all(&paths.state_dir) {
         eprintln!("cannot create state dir {}: {e}", paths.state_dir.display());
         return 1;
@@ -323,7 +328,6 @@ fn cmd_daemon(paths: &Paths) -> i32 {
         eprintln!("cannot write pidfile: {e}");
         return 1;
     }
-    let config = load_config(paths);
     let provider = select_provider(&config);
     let mut d = Daemon::new(paths.clone(), config, provider);
     d.run();
@@ -352,7 +356,9 @@ fn cmd_stop(paths: &Paths) -> i32 {
 }
 
 fn cmd_once(paths: &Paths, force: bool) -> i32 {
-    let config = load_config(paths);
+    let Some(config) = load_config(paths) else {
+        return 1;
+    };
     let provider = select_provider(&config);
     let mut d = Daemon::new(paths.clone(), config, provider);
     match d.pass(force) {
@@ -381,9 +387,12 @@ fn cmd_once(paths: &Paths, force: bool) -> i32 {
 }
 
 fn cmd_status(paths: &Paths) -> i32 {
+    let Some(status) = status_json(paths) else {
+        return 1;
+    };
     println!(
         "{}",
-        serde_json::to_string_pretty(&status_json(paths)).unwrap_or_default()
+        serde_json::to_string_pretty(&status).unwrap_or_default()
     );
     0
 }
