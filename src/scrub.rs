@@ -13,7 +13,6 @@ struct Patterns {
     header: Regex,
     /// `key = value` style; group 1 is the key name (kept), the value is replaced.
     keyed: Regex,
-    /// Patterns whose whole match is replaced.
     whole: Vec<Regex>,
     opaque: Regex,
 }

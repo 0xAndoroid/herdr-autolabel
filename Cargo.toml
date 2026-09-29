@@ -21,7 +21,6 @@ strip = true
 codegen-units = 1
 
 [lints.rust]
-# libc FFI (kill, flock, setsid, signal) needs unsafe; every block carries a SAFETY comment.
 unsafe_code = "allow"
 
 [lints.clippy]
@@ -56,8 +55,6 @@ unnecessary_wraps = "allow"
 unused_async = "allow"
 used_underscore_binding = "allow"
 
-# Cast lints — many false positives where range is known.
-# Note: cast_lossless is NOT allowed — prefer From::from() for clarity.
 cast_possible_truncation = "allow"
 cast_possible_wrap = "allow"
 cast_precision_loss = "allow"
@@ -72,7 +69,6 @@ undocumented_unsafe_blocks = "deny"
 
 result_large_err = "allow"
 
-# print_stdout/print_stderr stay allowed: the binary's stdout is the JSON protocol and stderr is its log.
 dbg_macro = "deny"
 todo = "deny"
 unimplemented = "deny"

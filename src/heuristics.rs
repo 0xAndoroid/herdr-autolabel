@@ -1,5 +1,3 @@
-//! Deterministic labels for well-known foreground processes; decides when the LLM is needed.
-
 use std::path::Path;
 
 use crate::label;
@@ -38,7 +36,6 @@ pub struct PaneFacts {
     pub fg: Option<Proc>,
     pub cwd: String,
     pub branch: Option<String>,
-    /// Agent kind from herdr (`claude`, `codex`, …).
     pub agent: Option<String>,
     pub agent_status: String,
 }
@@ -53,8 +50,6 @@ pub enum Decision {
     Llm { fallback: String },
 }
 
-/// Assistant TUIs whose conversations are not this pane's work: the pane and its space are
-/// named after the agent itself.
 const NAMED_AGENTS: &[&str] = &["pika"];
 
 const SHELLS: &[&str] = &[
@@ -78,7 +73,6 @@ const AGENTS: &[&str] = &[
     "qwen",
     "crush",
 ];
-/// Wrappers whose real command follows.
 const WRAPPERS: &[&str] = &[
     "sudo",
     "env",
@@ -93,7 +87,6 @@ const WRAPPERS: &[&str] = &[
     "unbuffer",
     "script",
 ];
-/// Full-screen tools labelled by name alone.
 const BY_NAME: &[&str] = &[
     "htop",
     "btop",
@@ -221,8 +214,6 @@ pub fn directory_name(cwd: &str) -> String {
     }
 }
 
-/// Picks the process that best describes the pane from a foreground process group: the first
-/// non-shell entry, or `None` when the group is empty or only shells (an idle prompt).
 /// The command typed at the prompt: the foreground process group's `leader`, else the first
 /// non-shell process (herdr lists the group deepest child first).
 pub fn pick_foreground(procs: &[Proc], leader: Option<u32>) -> Option<Proc> {
@@ -242,7 +233,6 @@ pub fn running_child(procs: &[Proc], typed: &Proc) -> Option<Proc> {
         .cloned()
 }
 
-/// Default branches say nothing about the work; the directory name is more useful then.
 fn is_default_branch(branch: &str) -> bool {
     matches!(branch, "main" | "master" | "trunk" | "develop")
 }
@@ -283,8 +273,6 @@ fn idle_label(facts: &PaneFacts) -> String {
     }
 }
 
-/// First argv element after the command that is not a flag, skipping `skip_with_value` flag
-/// arguments.
 fn first_positional<'a>(args: &'a [String], skip_with_value: &[&str]) -> Option<&'a str> {
     let mut iter = args.iter();
     while let Some(a) = iter.next() {
@@ -316,13 +304,11 @@ fn two(a: &str, b: Option<&str>) -> String {
     }
 }
 
-/// Label for a known process, or `None` when unknown.
 fn known_process_label(proc_: &Proc) -> Option<String> {
     let cmd = proc_.command();
     let args: &[String] = proc_.argv.get(1..).unwrap_or(&[]);
 
     if WRAPPERS.contains(&cmd.as_str()) {
-        // Recurse into the wrapped command (skip env assignments / wrapper flags).
         let inner: Vec<&str> = args
             .iter()
             .map(String::as_str)
@@ -482,7 +468,6 @@ fn known_process_label(proc_: &Proc) -> Option<String> {
     }
 }
 
-/// Best-effort label for an unknown process: `<cmd> <first non-numeric positional basename>`.
 pub fn generic_label(proc_: &Proc) -> String {
     let cmd = proc_.command();
     let args: &[String] = proc_.argv.get(1..).unwrap_or(&[]);
@@ -493,7 +478,6 @@ pub fn generic_label(proc_: &Proc) -> String {
     two(&cmd, arg.as_deref())
 }
 
-/// Decides how to label a pane.
 pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
     let fin = |s: &str| {
         let cleaned = label::finalize(s, 3, max_chars);
@@ -744,10 +728,8 @@ mod tests {
                 fallback: "codex pika".into()
             }
         );
-        // The Pika assistant is named after itself, no LLM.
         f.agent = Some("pika".into());
         assert_eq!(decide(&f, 24), Decision::Whole("pika".into()));
-        // node running the claude bundle.
         let f = facts(
             &[
                 "node",
@@ -813,7 +795,6 @@ mod tests {
         let typed = pick_foreground(&procs, Some(1)).unwrap();
         assert_eq!(typed, shop);
         assert_eq!(running_child(&procs, &typed), Some(docker.clone()));
-        // Without a leader the first non-shell entry stands, and nothing runs under it.
         let typed = pick_foreground(&procs, None).unwrap();
         assert_eq!(typed, docker);
         assert_eq!(running_child(&procs, &typed), None);

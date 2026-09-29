@@ -1,5 +1,3 @@
-//! Label post-processing shared by heuristics and the LLM path.
-
 /// Cleans a raw label: strips quotes/backticks/trailing punctuation, collapses whitespace, cuts
 /// to `max_words` words and then to `max_chars` characters (at a word boundary when possible).
 pub fn finalize(raw: &str, max_words: usize, max_chars: usize) -> String {
@@ -21,13 +19,11 @@ pub fn finalize(raw: &str, max_words: usize, max_chars: usize) -> String {
     truncate_words(trimmed.trim(), max_chars)
 }
 
-/// Words that say nothing at the end of a cut label ("keccak spec to").
 const DANGLING: &[&str] = &[
     "a", "an", "and", "at", "by", "for", "from", "in", "into", "of", "on", "or", "the", "to",
     "via", "with",
 ];
 
-/// Drops trailing connectives left behind by a cut; a single word is kept whatever it is.
 fn drop_dangling(words: &mut Vec<&str>) {
     while words.len() > 1
         && words
@@ -106,11 +102,9 @@ mod tests {
     #[test]
     fn cut_labels_drop_dangling_connectives() {
         assert_eq!(truncate_words("keccak spec to Pika", 16), "keccak spec");
-        // The word cap leaves the same debris.
         assert_eq!(finalize("keccak spec to Pika", 3, 22), "keccak spec");
         assert_eq!(finalize("waiting for CI", 3, 22), "waiting for CI");
         assert_eq!(truncate_words("handoff to the new API", 17), "handoff");
-        // Only a cut is cleaned up; a label that fits keeps its words.
         assert_eq!(truncate_words("waiting for", 22), "waiting for");
         assert_eq!(truncate_words("to somewhere else", 4), "to");
     }

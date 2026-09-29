@@ -16,15 +16,12 @@ const RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[derive(Debug)]
 pub enum Error {
-    /// Could not connect to the socket (server gone).
     Connect(std::io::Error),
-    /// A socket syscall failed; `step` names the failing operation (connect/write/read/…).
     Io {
         step: &'static str,
         err: std::io::Error,
     },
     Json(serde_json::Error),
-    /// Server-side error response.
     Api {
         code: String,
         message: String,
@@ -109,7 +106,6 @@ pub struct WorkspaceWorktree {
     pub checkout_path: String,
 }
 
-/// A sidebar space.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct WorkspaceInfo {
@@ -214,7 +210,6 @@ impl Client {
             .ok_or_else(|| Error::Protocol("missing result".into()))
     }
 
-    /// Connects, writes one request line and reads one response frame.
     fn exchange(&self, line: &str) -> Result<Vec<u8>, Error> {
         let io = |step| move |err| Error::Io { step, err };
         let mut stream = UnixStream::connect(&self.socket).map_err(Error::Connect)?;

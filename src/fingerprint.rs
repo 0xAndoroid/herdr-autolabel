@@ -1,5 +1,3 @@
-//! Pane fingerprint: cheap change detection so unchanged panes cost nothing.
-
 use std::hash::Hasher;
 
 /// FNV-1a 64-bit; stable across runs (unlike `DefaultHasher`).
