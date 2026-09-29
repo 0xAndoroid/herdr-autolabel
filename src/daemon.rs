@@ -565,6 +565,7 @@ impl Daemon {
         let mut dirty = states.len() != before;
         stats.spaces = snapshot.workspaces.len();
         let mut outcomes = Vec::with_capacity(snapshot.workspaces.len());
+        let mut failed = None;
 
         for ws in &snapshot.workspaces {
             if SHUTDOWN.load(Ordering::Relaxed) {
@@ -643,14 +644,20 @@ impl Daemon {
             let current = match self.client.workspace(id) {
                 Ok(w) => w,
                 Err(herdr::Error::Api { .. }) => continue, // closed meanwhile
-                Err(e) => return Err(e),
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
             };
             if current.label != ws.label {
                 log_debug!("{id}: space renamed during the pass; skipping");
                 outcomes.push(outcome(None, Source::SkippedManual, false));
                 continue;
             }
-            self.client.rename_workspace(id, &next)?;
+            if let Err(e) = self.client.rename_workspace(id, &next) {
+                failed = Some(e);
+                break;
+            }
             state.applied = Some(next.clone());
             dirty = true;
             stats.spaces_labeled += 1;
@@ -662,7 +669,7 @@ impl Daemon {
             log_warn!("spaces state write failed: {e}");
         }
         self.spaces = states;
-        Ok(outcomes)
+        failed.map_or(Ok(outcomes), Err)
     }
 
     /// Puts back the names spaces had before we renamed them; only spaces still carrying one
@@ -1295,6 +1302,50 @@ mod tests {
         assert!(spaces[0].applied);
         let seen = finish(&daemon, server);
         assert!(seen.iter().all(|r| r["method"] != "pane.report_metadata"));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn failed_space_rename_keeps_earlier_renames_in_state() {
+        let root = std::env::temp_dir().join(format!("hal-rename-fail-{}", std::process::id()));
+        for d in ["pika/.git", "pika/crates", "jolt/.git", "jolt/sub"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
+        let mut replies = vec![(
+            "session.snapshot",
+            snapshot(
+                vec![
+                    pane_json("w1:p1", "w1", &p("pika/crates"), true, None),
+                    pane_json("w2:p1", "w2", &p("jolt/sub"), false, None),
+                ],
+                vec![ws("w1", "pika", true), ws("w2", "jolt", false)],
+            ),
+        )];
+        replies.extend(unchanged_pane());
+        replies.extend(unchanged_pane());
+        replies.extend([
+            (
+                "workspace.get",
+                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
+            ),
+            ("workspace.rename", json!({"result": {"type": "ok"}})),
+            (
+                "workspace.get",
+                json!({"result": {"workspace": {"workspace_id": "w2", "label": "jolt"}}}),
+            ),
+            (
+                "workspace.rename",
+                json!({"error": {"code": "busy", "message": "retry"}}),
+            ),
+        ]);
+        let config = Config::parse("label_panes = false\n").unwrap();
+        let (mut daemon, server) = mock_daemon_with("rename-fail", config, replies);
+        assert!(daemon.pass(false).is_err());
+        let states = spaces::load_states(&daemon.paths.spaces_file());
+        assert_eq!(states["w1"].original, "pika");
+        assert_eq!(states["w1"].applied.as_deref(), Some("pika: crates"));
+        finish(&daemon, server);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
