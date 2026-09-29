@@ -221,6 +221,9 @@ fn cmd_start(paths: &Paths) -> i32 {
         println!("{status}");
         return 0;
     }
+    if load_config(paths).is_none() {
+        return 1;
+    }
     if let Err(e) = std::fs::create_dir_all(&paths.state_dir) {
         eprintln!("cannot create state dir {}: {e}", paths.state_dir.display());
         return 1;
