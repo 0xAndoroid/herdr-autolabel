@@ -507,6 +507,7 @@ pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
         return Decision::Label(fin(&idle_label(facts)));
     }
     match known_process_label(proc_) {
+        Some(l) if l.starts_with("ssh ") => Decision::Whole(fin(&l)),
         Some(l) => Decision::Label(fin(&l)),
         None => Decision::Llm {
             fallback: fin(&generic_label(proc_)),
@@ -751,6 +752,25 @@ mod tests {
             Some("codex")
         );
         assert_eq!(agent_of(&Proc::new(&["node", "server.js"])), None);
+    }
+
+    #[test]
+    fn ssh_panes_are_whole_names() {
+        for argv in [
+            &["ssh", "user@mini.local"][..],
+            &["env", "TERM=xterm", "ssh", "user@mini.local"],
+            &["sudo", "ssh", "user@mini.local"],
+        ] {
+            assert_eq!(
+                decide(&facts(argv, "/r", None), 24),
+                Decision::Whole("ssh mini.local".into()),
+                "{argv:?}"
+            );
+        }
+        assert_eq!(
+            decide(&facts(&["tail", "-f", "x.log"], "/r", None), 24),
+            Decision::Label("tail -f x.log".into())
+        );
     }
 
     #[test]
