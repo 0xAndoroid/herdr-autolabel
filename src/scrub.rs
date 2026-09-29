@@ -13,8 +13,10 @@ const KEY: &str =
 struct Patterns {
     /// `Authorization: …` / `Cookie: …` headers: everything after the colon is replaced.
     header: Regex,
-    /// `key = value` or `--key value`; group 1 (key and separator) is kept, the value is replaced.
+    /// `key = value` style; group 1 (key and separator) is kept, the value is replaced.
     keyed: Regex,
+    /// `--key value`; group 1 (flag and whitespace) is kept, the whole shell word after it is replaced.
+    flag: Regex,
     whole: Vec<Regex>,
     opaque: Regex,
 }
@@ -28,7 +30,11 @@ fn compile() -> Result<Patterns, regex::Error> {
     Ok(Patterns {
         header: Regex::new(r"(?i)(\b(?:(?:proxy-)?authorization|(?:set-)?cookie)\s*:\s*).+$")?,
         keyed: Regex::new(&format!(
-            r#"(?i)(\B-{KEY}\s+|\b{KEY}["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#
+            r#"(?i)(\b{KEY}["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#
+        ))?,
+        // A bare value never starts with `-`: that token is the next flag, as CLI parsers read it.
+        flag: Regex::new(&format!(
+            r#"(?i)(\B-{KEY}\s+)(?:(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$))\S*|[^\s-](?:\\.|\S)*)"#
         ))?,
         whole: [
             r#"(?i)\bbearer\s+[^\s'"]+"#,
@@ -57,6 +63,7 @@ pub fn scrub_line(line: &str) -> String {
     let keep_key = |caps: &regex::Captures| format!("{}{REDACTED}", &caps[1]);
     let mut out = p.header.replace_all(line, keep_key).into_owned();
     out = p.keyed.replace_all(&out, keep_key).into_owned();
+    out = p.flag.replace_all(&out, keep_key).into_owned();
     for re in &p.whole {
         if re.is_match(&out) {
             out = re.replace_all(&out, REDACTED).into_owned();
@@ -152,6 +159,16 @@ mod tests {
             ("login --token 'abc def'", "login --token [redacted]"),
             (r#"login --token "abc def"#, "login --token [redacted]"),
             ("--password=hunter2", "--password=[redacted]"),
+            (
+                "--token-refresh --password hunter2",
+                "--token-refresh --password [redacted]",
+            ),
+            ("--password ,hunter2", "--password [redacted]"),
+            (r#"--password ""hunter2"#, "--password [redacted]"),
+            (
+                r"scp --password hunter\ two host",
+                "scp --password [redacted] host",
+            ),
         ] {
             assert_eq!(scrub_line(line), want, "{line}");
         }
