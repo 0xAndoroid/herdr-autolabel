@@ -7,12 +7,16 @@ use regex::Regex;
 pub const MAX_LINES: usize = 40;
 pub const MAX_LINE_CHARS: usize = 300;
 const REDACTED: &str = "[redacted]";
+const KEY: &str =
+    "[A-Za-z0-9_-]*(?:token|api[_-]?key|secret|password|passwd|authorization|cookie)[A-Za-z0-9_-]*";
 
 struct Patterns {
     /// `Authorization: …` / `Cookie: …` headers: everything after the colon is replaced.
     header: Regex,
-    /// `key = value` style; group 1 is the key name (kept), the value is replaced.
+    /// `key = value` style; group 1 (key and separator) is kept, the value is replaced.
     keyed: Regex,
+    /// `--key value`; group 1 (flag and whitespace) is kept, the whole shell word after it is replaced.
+    flag: Regex,
     whole: Vec<Regex>,
     opaque: Regex,
 }
@@ -24,10 +28,14 @@ fn patterns() -> Option<&'static Patterns> {
 
 fn compile() -> Result<Patterns, regex::Error> {
     Ok(Patterns {
-        header: Regex::new(r"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*:\s*).+$")?,
-        keyed: Regex::new(
-            r#"(?i)\b([A-Za-z0-9_-]*(?:token|api[_-]?key|secret|password|passwd|authorization|cookie)[A-Za-z0-9_-]*)(["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#,
-        )?,
+        header: Regex::new(r"(?i)(\b(?:(?:proxy-)?authorization|(?:set-)?cookie)\s*:\s*).+$")?,
+        keyed: Regex::new(&format!(
+            r#"(?i)(\b{KEY}["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#
+        ))?,
+        // A bare value never starts with `-`: that token is the next flag, as CLI parsers read it.
+        flag: Regex::new(&format!(
+            r#"(?i)(\B-{KEY}\s+)(?:(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$))\S*|[^\s-](?:\\.|\S)*)"#
+        ))?,
         whole: [
             r#"(?i)\bbearer\s+[^\s'"]+"#,
             r"sk-ant-\S+",
@@ -52,9 +60,10 @@ pub fn scrub_line(line: &str) -> String {
     let Some(p) = patterns() else {
         return REDACTED.to_string();
     };
-    let keep_key = |caps: &regex::Captures| format!("{}{}{REDACTED}", &caps[1], &caps[2]);
+    let keep_key = |caps: &regex::Captures| format!("{}{REDACTED}", &caps[1]);
     let mut out = p.header.replace_all(line, keep_key).into_owned();
     out = p.keyed.replace_all(&out, keep_key).into_owned();
+    out = p.flag.replace_all(&out, keep_key).into_owned();
     for re in &p.whole {
         if re.is_match(&out) {
             out = re.replace_all(&out, REDACTED).into_owned();
@@ -136,6 +145,36 @@ mod tests {
     }
 
     #[test]
+    fn space_separated_secret_flags() {
+        for (line, want) in [
+            ("worker --password hunter2", "worker --password [redacted]"),
+            (
+                r#"worker --password "hunter two" --verbose"#,
+                "worker --password [redacted] --verbose",
+            ),
+            (
+                "cli --api-key sk-live-abcdef --region us",
+                "cli --api-key [redacted] --region us",
+            ),
+            ("login --token 'abc def'", "login --token [redacted]"),
+            (r#"login --token "abc def"#, "login --token [redacted]"),
+            ("--password=hunter2", "--password=[redacted]"),
+            (
+                "--token-refresh --password hunter2",
+                "--token-refresh --password [redacted]",
+            ),
+            ("--password ,hunter2", "--password [redacted]"),
+            (r#"--password ""hunter2"#, "--password [redacted]"),
+            (
+                r"scp --password hunter\ two host",
+                "scp --password [redacted] host",
+            ),
+        ] {
+            assert_eq!(scrub_line(line), want, "{line}");
+        }
+    }
+
+    #[test]
     fn bearer() {
         assert_eq!(
             scrub_line("curl -H 'Bearer abcdef' x"),
@@ -188,6 +227,9 @@ mod tests {
             "review PR 1283 for the auth refactor",
             "git checkout feat/moving-button",
             "The token count is 42",
+            "the token count is 42",
+            "password reset flow works",
+            "rotate the secret weekly",
             "❯ ",
         ] {
             assert_eq!(scrub_line(s), s);
