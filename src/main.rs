@@ -1,5 +1,3 @@
-//! herdr-autolabel — labels every herdr pane with a terse title describing what is happening in it.
-
 mod config;
 mod daemon;
 mod fingerprint;
@@ -117,8 +115,6 @@ fn select_provider(config: &config::Config) -> Option<llm::Provider> {
     }
 }
 
-// ---- pidfile helpers -------------------------------------------------------------------------
-
 fn read_pid(paths: &Paths) -> Option<i32> {
     std::fs::read_to_string(paths.pidfile())
         .ok()?
@@ -220,8 +216,6 @@ fn status_json(paths: &Paths) -> serde_json::Value {
     })
 }
 
-// ---- subcommands -----------------------------------------------------------------------------
-
 fn cmd_start(paths: &Paths) -> i32 {
     if let Some(pid) = running_pid(paths) {
         logging::log_info!("daemon already running (pid {pid})");
@@ -233,7 +227,6 @@ fn cmd_start(paths: &Paths) -> i32 {
         return 1;
     }
     let log_path = paths.log_file();
-    // Keep the log bounded.
     if std::fs::metadata(&log_path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
         let _ = std::fs::rename(&log_path, paths.state_dir.join("daemon.log.1"));
     }
@@ -282,8 +275,7 @@ fn cmd_start(paths: &Paths) -> i32 {
             return 1;
         }
     };
-    drop(child); // Not waited on: it is reparented once we exit.
-    // Give the daemon a moment to write its pidfile so the printed status is accurate.
+    drop(child);
     let deadline = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < deadline && running_pid(paths).is_none() {
         std::thread::sleep(Duration::from_millis(50));

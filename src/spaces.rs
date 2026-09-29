@@ -12,11 +12,9 @@ use crate::label;
 /// Passes a new candidate must persist before a space that already has a label is renamed.
 pub const HYSTERESIS_PASSES: u32 = 2;
 
-/// What a pane contributes to its space's label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaneSummary {
     pub label: String,
-    /// A coding agent (claude/codex/pika/…) runs in the pane.
     pub agent: bool,
     /// A command runs in the pane, or someone named it: the label says what is done, not only
     /// where.
@@ -74,7 +72,6 @@ pub fn aggregate(
     })
 }
 
-/// The project named by most panes; ties go to the first pane seen.
 fn dominant_project(panes: &[&PaneSummary]) -> Option<String> {
     let mut counts: Vec<(&str, usize)> = Vec::new();
     for project in panes.iter().filter_map(|p| p.project.as_deref()) {
@@ -132,10 +129,8 @@ impl SpaceState {
     }
 }
 
-/// Who owns the space's current label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Ownership {
-    /// Our label from this or a previous run.
     Ours,
     /// herdr's default (the cwd basename) or a name we may replace.
     Default,
@@ -199,7 +194,6 @@ pub fn default_names<'a>(
     names
 }
 
-/// Persisted map workspace_id → state.
 pub type SpaceStates = HashMap<String, SpaceState>;
 
 pub fn load_states(path: &Path) -> SpaceStates {
@@ -265,7 +259,6 @@ mod tests {
             aggregate(&panes, None, 24).as_deref(),
             Some("jolt: cargo build")
         );
-        // The activity alone without a cwd; the project alone when the activity repeats it.
         let panes = [pane("ssh mini", false, true, None)];
         assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("ssh mini"));
         let panes = [pane("pika", false, false, Some("pika"))];
@@ -301,7 +294,6 @@ mod tests {
             aggregate(&panes, None, 24).as_deref(),
             Some("pika: fixing auth tests")
         );
-        // Several agents: the first one, whatever is focused.
         let panes = [
             pane("wt switch", true, true, Some("pika")),
             pane("watching CI run", true, true, Some("pika")),
@@ -320,7 +312,6 @@ mod tests {
             pane("cargo test", false, true, Some("pika")),
         ];
         assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("pika: htop"));
-        // Ties resolve to the first project seen; idle shells fall back to the first label.
         let panes = [
             pane("sub", false, false, Some("jolt")),
             pane("crates", false, false, Some("pika")),
@@ -335,7 +326,6 @@ mod tests {
             aggregate(&panes, None, 22).as_deref(),
             Some("web: delegating keccak")
         );
-        // A project that leaves no room for the activity's first word stands alone.
         let panes = [pane(
             "cargo build",
             false,
@@ -374,26 +364,21 @@ mod tests {
     #[test]
     fn hysteresis_needs_two_consecutive_passes() {
         let mut s = SpaceState::default();
-        // First label applies immediately.
         assert_eq!(s.observe(Some("pika"), false).as_deref(), Some("pika"));
         s.applied = Some("pika".into());
         assert_eq!(s.observe(Some("pika"), false), None);
-        // A transient change is ignored …
         assert_eq!(s.observe(Some("cargo build"), false), None);
         assert_eq!(s.observe(Some("pika"), false), None);
         assert_eq!(s.pending, None);
-        // … a change seen twice in a row is applied.
         assert_eq!(s.observe(Some("cargo build"), false), None);
         assert_eq!(
             s.observe(Some("cargo build"), false).as_deref(),
             Some("cargo build")
         );
-        // Alternating candidates never settle.
         s.applied = Some("cargo build".into());
         assert_eq!(s.observe(Some("a"), false), None);
         assert_eq!(s.observe(Some("b"), false), None);
         assert_eq!(s.observe(Some("a"), false), None);
-        // Force bypasses the window; no candidate leaves the label alone.
         assert_eq!(s.observe(Some("b"), true).as_deref(), Some("b"));
         assert_eq!(s.observe(None, false), None);
     }
@@ -409,7 +394,6 @@ mod tests {
         assert!(defaults.contains(&"pika".to_string()));
         assert!(defaults.contains(&"jolt".to_string()));
         assert!(defaults.contains(&"feat-a".to_string()));
-        // Never seen: taken over whatever the name (herdr's default or a programmatic label).
         assert_eq!(classify("pika", None, &defaults), Ownership::Default);
         assert_eq!(classify("my project", None, &defaults), Ownership::Default);
         let blank = SpaceState::default();
@@ -426,16 +410,12 @@ mod tests {
             classify("fixing tests", Some(&ours), &defaults),
             Ownership::Ours
         );
-        // Renamed by the user after we labelled it.
         assert_eq!(
             classify("my project", Some(&ours), &defaults),
             Ownership::Manual
         );
-        // Reset to a default name: ours to take again.
         assert_eq!(classify("pika", Some(&ours), &defaults), Ownership::Default);
         assert_eq!(classify("3", Some(&ours), &defaults), Ownership::Default);
-        // Released earlier (applied cleared, original kept): stays the user's until it is set
-        // back to the original or a default name.
         let released = SpaceState {
             original: "old-dir".into(),
             ..Default::default()

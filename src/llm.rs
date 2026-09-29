@@ -1,5 +1,3 @@
-//! LLM labelling: provider selection, prompt construction, request, post-processing.
-
 use std::fmt;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -76,7 +74,6 @@ pub struct Provider {
     pub kind: Kind,
     pub model: String,
     key: String,
-    /// System prompt: the config's `prompt`, else `DEFAULT_PROMPT`.
     prompt: String,
 }
 
@@ -169,7 +166,6 @@ pub fn select(config: &Config) -> Result<Option<Provider>, String> {
     }
 }
 
-/// Context for one labelling request.
 #[derive(Debug, Clone, Default)]
 pub struct Context<'a> {
     pub agent: Option<&'a str>,
@@ -194,8 +190,6 @@ pub struct Context<'a> {
     pub lines: &'a [&'a str],
 }
 
-/// Builds the user message: facts block, the name budget, PR mentions, then the scrubbed
-/// screen.
 pub fn user_message(ctx: &Context, max_chars: usize) -> String {
     let clean = |value: &str| scrub::scrub_line(&value.replace(['\n', '\r'], " "));
     let mut out = String::new();
@@ -382,7 +376,6 @@ impl Provider {
         Ok(text)
     }
 
-    /// Full pipeline: prompt → completion → cleaned label (empty string when unusable).
     pub fn label(&self, ctx: &Context, max_chars: usize) -> Result<String, Error> {
         let raw = self.complete(&user_message(ctx, max_chars))?;
         let cleaned = postprocess(&raw, max_chars);
@@ -484,7 +477,6 @@ mod tests {
         assert!(msg.starts_with(
             "user's request: Review PR\nsession topic: AI GP agent design\nsession's first request: make the AI GP more chat like\nagent: claude"
         ));
-        // A title that is the request itself (no transcript) is not repeated as the topic.
         let titled = Context {
             request: Some("Review PR"),
             topic: Some("Review PR"),

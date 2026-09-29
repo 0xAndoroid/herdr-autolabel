@@ -9,11 +9,8 @@ pub const MAX_LINE_CHARS: usize = 300;
 const REDACTED: &str = "[redacted]";
 
 struct Patterns {
-    /// `Authorization: …` / `Cookie: …` headers: everything after the colon is replaced.
     header: Regex,
-    /// `key = value` style; group 1 is the key name (kept), the value is replaced.
     keyed: Regex,
-    /// Patterns whose whole match is replaced.
     whole: Vec<Regex>,
     opaque: Regex,
 }

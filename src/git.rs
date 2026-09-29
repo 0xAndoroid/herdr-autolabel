@@ -31,7 +31,6 @@ pub fn repo_basename(cwd: &Path) -> Option<String> {
     None
 }
 
-/// Resolves `<dir>/.git` to the directory holding `HEAD` (handles worktree `.git` files).
 fn git_dir_at(dir: &Path) -> Option<PathBuf> {
     let dot_git = dir.join(".git");
     let meta = std::fs::metadata(&dot_git).ok()?;
@@ -120,7 +119,6 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", common.display())).unwrap();
         assert_eq!(branch_for(&wt).as_deref(), Some("wt-branch"));
-        // Relative gitdir too.
         std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt1\n").unwrap();
         assert_eq!(branch_for(&wt).as_deref(), Some("wt-branch"));
         let _ = std::fs::remove_dir_all(&root);
@@ -134,7 +132,6 @@ mod tests {
         assert_eq!(branch_for(&root), None);
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        // 8 levels down is beyond the 6-parent walk.
         assert_eq!(branch_for(&deep), None);
         assert_eq!(
             branch_for(&root.join("1/2/3/4/5/6")).as_deref(),

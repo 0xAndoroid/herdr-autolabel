@@ -1,5 +1,3 @@
-# herdr-autolabel — labels every pane with a terse title describing what is happening in it.
-# Install: cargo build --release && herdr plugin link ~/dev/herdr-autolabel
 id = "andoroid.autolabel"
 name = "Auto-label panes and spaces"
 version = "0.1.0"

@@ -13,13 +13,9 @@ use serde_json::Value;
 
 use crate::herdr::AgentSession;
 
-/// Bytes read from the end of a transcript; a prompt buried deeper than this is not found.
 const TAIL_BYTES: u64 = 4 << 20;
-/// Bytes read from the start of a transcript for the first prompt.
 const HEAD_BYTES: u64 = 1 << 20;
-/// Characters of the prompt kept for the label request.
 pub const MAX_PROMPT_CHARS: usize = 300;
-/// Directory levels searched below a session root when herdr reports only an id.
 const MAX_DEPTH: usize = 3;
 
 /// Per-session cache of the last prompt, re-read only when the transcript file changed.
@@ -97,8 +93,6 @@ fn locate(session: &AgentSession) -> Option<PathBuf> {
         .find_map(|root| find(&home.join(root), &session.value, MAX_DEPTH))
 }
 
-/// `<dir>/**/<stem>.jsonl` where the stem is `id` or ends with `-<id>` / `_<id>`, descending at
-/// most `depth` levels.
 fn find(dir: &Path, id: &str, depth: usize) -> Option<PathBuf> {
     let mut dirs = Vec::new();
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
@@ -161,8 +155,6 @@ pub fn prompt_in<'a>(agent: &str, lines: impl Iterator<Item = &'a str>) -> Optio
     })
 }
 
-/// Words a prompt may consist of entirely and still say nothing about the task ("continue",
-/// "ok, do it"); the prompt before it is the request then.
 const ACKNOWLEDGEMENTS: &[&str] = &[
     "continue", "go", "ahead", "on", "ok", "okay", "yes", "y", "yep", "yeah", "sure", "proceed",
     "next", "do", "it", "please", "resume", "carry", "fine", "cool", "good", "great", "thanks",
@@ -309,7 +301,6 @@ mod tests {
             last("claude", &lines.join("\n")).as_deref(),
             Some("fix the flaky test in auth")
         );
-        // A prompt with an injected reminder block keeps only the typed block.
         let mixed = user(
             r#"[{"type":"text","text":"<system-reminder>x</system-reminder>"},{"type":"text","text":"review PR 12"}]"#,
             "",

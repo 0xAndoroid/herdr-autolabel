@@ -18,9 +18,7 @@ pub struct Config {
     pub llm_global_per_min: u32,
     pub allow: Vec<String>,
     pub deny: Vec<String>,
-    /// Title panes (pane borders) with their activity label.
     pub label_panes: bool,
-    /// Rename sidebar spaces (workspaces) after the activity of their panes.
     pub label_spaces: bool,
 }
 

@@ -1,5 +1,3 @@
-//! The labelling loop: snapshot → per-pane facts → fingerprint → heuristics/LLM → report title.
-
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +21,6 @@ const CACHE_CAPACITY: usize = 256;
 
 pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
-/// Where the daemon keeps its files.
 #[derive(Debug, Clone)]
 pub struct Paths {
     pub socket: PathBuf,
@@ -65,7 +62,6 @@ impl Paths {
         self.config_dir.join("config.toml")
     }
 
-    /// Space ownership state, per socket like the pidfile.
     pub fn spaces_file(&self) -> PathBuf {
         let h = fingerprint::hash_str(&self.socket.to_string_lossy());
         self.state_dir.join(format!("spaces-{h:016x}.json"))
@@ -84,9 +80,7 @@ pub enum Source {
     SkippedManual,
     SkippedFilter,
     SkippedTitle,
-    /// Space label derived from its panes.
     Aggregate,
-    /// Space candidate waiting out the hysteresis window.
     Pending,
 }
 
@@ -135,7 +129,6 @@ impl LabelCache {
 
     fn get(&mut self, key: u64) -> Option<String> {
         let v = self.map.get(&key).cloned()?;
-        // Move to back (most recently used).
         if let Some(pos) = self.order.iter().position(|k| *k == key) {
             self.order.remove(pos);
         }
@@ -162,18 +155,14 @@ pub struct Daemon {
     client: Client,
     limiter: RateLimiter,
     cache: LabelCache,
-    /// Last processed fingerprint per pane.
     last_fp: HashMap<String, u64>,
     /// Title we last reported per pane.
     applied: HashMap<String, String>,
     /// Current label per pane, written or not (`label_panes = false`, manual names, …).
     labels: HashMap<String, PaneSummary>,
-    /// The user's last prompt per Claude session, from its transcript.
     prompts: transcript::Prompts,
     /// Space ownership + hysteresis, mirrored in `Paths::spaces_file`.
     spaces: SpaceStates,
-    /// A different title owner was observed; leave the pane alone until it closes.
-    /// Panes whose title we cleared because of a manual label.
     cleared: HashSet<String>,
     started_at: String,
     pass_count: u64,
@@ -313,9 +302,6 @@ impl Daemon {
         };
 
         if let Some(source) = self.skip_pane(pane, stats)? {
-            // Skipped panes still tell their space what they show. A title from another source
-            // (or from a previous run of ours) is already a whole name; a hand-typed pane name
-            // is the activity.
             let shown = match source {
                 Source::SkippedManual => pane.label.clone(),
                 Source::SkippedTitle => pane.title.clone(),
@@ -384,7 +370,6 @@ impl Daemon {
             agent: pane.agent.clone().filter(|a| !a.is_empty()),
             agent_status: agent_status.clone(),
         };
-        // The agent's transcript has the user's prompts verbatim; herdr reports the session.
         let session = pane.agent_session.as_ref().filter(|s| !s.value.is_empty());
         let prompt = session.and_then(|s| self.prompts.last(s));
         let first_prompt = session
@@ -404,7 +389,6 @@ impl Daemon {
                 .as_deref()
                 .filter(|t| !t.trim().is_empty() && !t.to_ascii_lowercase().starts_with(kind))
         });
-        // The user's request: the last prompt itself, else that title.
         let request = prompt.as_deref().or(title);
         let fp = Fingerprint {
             process: fg
@@ -412,8 +396,6 @@ impl Daemon {
                 .map(|p| {
                     let mut v = vec![p.command()];
                     v.extend(p.argv.iter().skip(1).take(2).cloned());
-                    // A command's phases (`docker build`, then `docker logs`) relabel it; an
-                    // agent's tool calls do not.
                     if let Some(c) = child.as_ref().filter(|_| agent_kind.is_none()) {
                         v.push(c.command());
                         v.extend(c.argv.iter().skip(1).take(1).cloned());
@@ -447,7 +429,6 @@ impl Daemon {
         }
 
         let decision = heuristics::decide(&facts, self.config.max_chars);
-        // LLM-written names already carry the project as far as it helps.
         let whole = !matches!(decision, Decision::Label(_));
         let (label, source, record_fp) = match decision {
             Decision::Label(l) | Decision::Whole(l) => (l, Source::Heuristic, true),
@@ -509,8 +490,6 @@ impl Daemon {
                         }
                     } else {
                         log_debug!("{id}: llm rate-limited; keeping previous label");
-                        // Keep the previous label (or the fallback when there is none) and don't
-                        // record the fingerprint so the next pass retries.
                         match self.labels.get(&id).map(|l| l.label.clone()) {
                             Some(previous) => (previous, Source::RateLimited, false),
                             None => (fallback, Source::Fallback, false),
@@ -526,8 +505,6 @@ impl Daemon {
             self.labels.remove(&id);
             return Ok(outcome(None, source, false));
         }
-        // A stand-in name (no LLM, or still waiting for its budget) titles the pane only; its
-        // space keeps herdr's default until a real name exists.
         if source == Source::Fallback {
             self.labels.remove(&id);
         } else {
@@ -562,7 +539,6 @@ impl Daemon {
         Ok(outcome(Some(label), source, false))
     }
 
-    /// Labels every sidebar space from the labels its panes got in this pass.
     fn handle_spaces(
         &mut self,
         snapshot: &Snapshot,
@@ -654,7 +630,6 @@ impl Daemon {
                 continue;
             };
             if next == ws.label {
-                // herdr's own name already says it (single `pika` pane in a `pika` space).
                 state.applied = Some(next.clone());
                 dirty = true;
                 outcomes.push(outcome(Some(next), Source::Aggregate, false));
@@ -663,7 +638,7 @@ impl Daemon {
             // Pane labelling (and its LLM calls) ran after the snapshot; recheck the name.
             let current = match self.client.workspace(id) {
                 Ok(w) => w,
-                Err(herdr::Error::Api { .. }) => continue, // closed meanwhile
+                Err(herdr::Error::Api { .. }) => continue,
                 Err(e) => return Err(e),
             };
             if current.label != ws.label {
@@ -750,9 +725,6 @@ impl Daemon {
             .as_ref()
             .is_some_and(|title| !title.is_empty() && self.applied.get(id) != Some(title))
         {
-            // A title we did not apply: either ours from a previous daemon run (cleared
-            // once via `clear_if_ours`, after which the pane is labelled again) or another
-            // source's, which keeps winning for as long as it is present.
             Some(Source::SkippedTitle)
         } else {
             None
@@ -848,7 +820,6 @@ mod tests {
 
     use super::*;
 
-    /// Joins the mock server and removes its state dir (only once the daemon is done with it).
     fn finish(
         daemon: &Daemon,
         server: std::thread::JoinHandle<Vec<serde_json::Value>>,
@@ -865,8 +836,6 @@ mod tests {
         mock_daemon_with(name, Config::default(), replies)
     }
 
-    /// Serves `replies` in order, one connection each, asserting the method of every request;
-    /// joining the server yields the requests it saw.
     fn mock_daemon_with(
         name: &str,
         config: Config,
@@ -916,8 +885,6 @@ mod tests {
         for manual in [false, true] {
             let mut replies = vec![("pane.report_metadata", json!({"result": {"type": "ok"}}))];
             if !manual {
-                // Once the competing title is gone (e.g. it was ours from a previous daemon
-                // run), the pane is labelled again.
                 replies.extend([
                     ("pane.process_info", json!({"result": {"process_info": {}}})),
                     ("pane.get", json!({"result": {"pane": {"pane_id": "p1"}}})),
@@ -1114,7 +1081,6 @@ mod tests {
 
     #[test]
     fn spaces_follow_their_panes_with_hysteresis_and_restore_on_stop() {
-        // Two fake repos (a `.git` dir is enough for repo/branch detection).
         let root = std::env::temp_dir().join(format!("hal-spaces-repos-{}", std::process::id()));
         for d in [
             "pika/.git",
@@ -1126,9 +1092,6 @@ mod tests {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
-        // w1: one idle pane in pika/crates → "pika: crates" (herdr named the space "pika").
-        // w2: two idle panes in the jolt repo, the first at its root → "jolt", which is
-        // already the space's own name → recorded, not renamed.
         let mut replies = vec![(
             "session.snapshot",
             snapshot(
@@ -1150,7 +1113,6 @@ mod tests {
             ),
             ("workspace.rename", json!({"result": {"type": "ok"}})),
         ]);
-        // Pass 2: w1's pane moved to pika/src → pane relabelled at once, space waits.
         let pass2_panes = vec![
             pane_json("w1:p1", "w1", &p("pika/src"), false, Some("crates")),
             pane_json("w2:p1", "w2", &p("jolt"), true, Some("jolt")),
@@ -1161,7 +1123,6 @@ mod tests {
         replies.extend(labelled_pane("w1:p1"));
         replies.extend(unchanged_pane());
         replies.extend(unchanged_pane());
-        // Pass 3: same picture again → the space follows.
         let pass3_panes = vec![
             pane_json("w1:p1", "w1", &p("pika/src"), false, Some("src")),
             pane_json("w2:p1", "w2", &p("jolt"), true, Some("jolt")),
@@ -1178,7 +1139,6 @@ mod tests {
             ),
             ("workspace.rename", json!({"result": {"type": "ok"}})),
         ]);
-        // Stop: w1 goes back to "pika"; w2 never changed name.
         replies.push((
             "session.snapshot",
             snapshot(
@@ -1244,8 +1204,6 @@ mod tests {
 
     #[test]
     fn hand_named_spaces_are_never_renamed() {
-        // w1 was released earlier (the user renamed it away from "pika" and we let go); w2 was
-        // renamed by the user after we named it → released now. Neither is touched.
         let mut replies = vec![(
             "session.snapshot",
             snapshot(
@@ -1290,7 +1248,6 @@ mod tests {
             states["w2"].applied, None,
             "released after the user's rename"
         );
-        // Nothing to restore either.
         daemon.restore_spaces();
         assert!(
             finish(&daemon, server)
@@ -1374,7 +1331,6 @@ mod tests {
         assert_eq!(c.map.len(), CACHE_CAPACITY);
         assert_eq!(c.get(0), None);
         assert_eq!(c.get(CACHE_CAPACITY as u64 + 9).as_deref(), Some("l265"));
-        // Touching an entry keeps it alive past the next eviction.
         assert!(c.get(10).is_some());
         c.insert(9999, "x".into());
         assert!(c.get(10).is_some());
