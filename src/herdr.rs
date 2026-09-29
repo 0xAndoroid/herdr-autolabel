@@ -363,13 +363,13 @@ pub fn default_socket_path() -> PathBuf {
 }
 
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, clippy::panic)]
+
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
@@ -518,6 +518,8 @@ mod tests {
 
 #[cfg(test)]
 mod stress {
+    #![expect(clippy::unwrap_used)]
+
     //! `cargo nextest run --run-ignored ignored-only stress` — hammers one-shot exchanges against
     //! a local server to surface intermittent socket errors (the EINVAL papercut).
     use super::*;
@@ -525,7 +527,7 @@ mod stress {
     use std::os::unix::net::UnixListener;
 
     #[test]
-    #[ignore]
+    #[ignore = "stress test; run on demand"]
     fn one_shot_exchanges_under_load() {
         let sock = std::env::temp_dir().join(format!("hal-stress-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);

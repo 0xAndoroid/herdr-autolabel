@@ -216,6 +216,8 @@ pub fn save_states(path: &Path, states: &SpaceStates) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use super::*;
 
     fn pane(label: &str, agent: bool, busy: bool, project: Option<&str>) -> PaneSummary {

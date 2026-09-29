@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -32,12 +33,15 @@ jobs:
           tool: typos-cli
       - run: cargo fmt --all -- --check
       - run: typos
+      - if: always()
+        run: echo "lint wall $(( $(date +%s) - JOB_START ))s" >> "$GITHUB_STEP_SUMMARY"
 
   test:
     name: clippy + nextest
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
+      - run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
@@ -46,5 +50,7 @@ jobs:
       - uses: taiki-e/install-action@26e9283f268b880168bdbd2c545dfcd60ec2c6ab # v2.87.13
         with:
           tool: nextest
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --message-format=short -- -D warnings
       - run: cargo nextest run
+      - if: always()
+        run: echo "test wall $(( $(date +%s) - JOB_START ))s" >> "$GITHUB_STEP_SUMMARY"

@@ -18,14 +18,17 @@ struct Patterns {
     opaque: Regex,
 }
 
-fn patterns() -> &'static Patterns {
-    static P: OnceLock<Patterns> = OnceLock::new();
-    P.get_or_init(|| Patterns {
-        header: Regex::new(r"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*:\s*).+$").unwrap(),
+fn patterns() -> Option<&'static Patterns> {
+    static P: OnceLock<Option<Patterns>> = OnceLock::new();
+    P.get_or_init(|| compile().ok()).as_ref()
+}
+
+fn compile() -> Result<Patterns, regex::Error> {
+    Ok(Patterns {
+        header: Regex::new(r"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*:\s*).+$")?,
         keyed: Regex::new(
             r#"(?i)\b([A-Za-z0-9_-]*(?:token|api[_-]?key|secret|password|passwd|authorization|cookie)[A-Za-z0-9_-]*)(["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#,
-        )
-        .unwrap(),
+        )?,
         whole: [
             r#"(?i)\bbearer\s+[^\s'"]+"#,
             r"sk-ant-\S+",
@@ -38,15 +41,18 @@ fn patterns() -> &'static Patterns {
             r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
         ]
         .iter()
-        .map(|p| Regex::new(p).unwrap())
-        .collect(),
-        opaque: Regex::new(r"[A-Za-z0-9+/=_-]{40,}").unwrap(),
+        .map(|p| Regex::new(p))
+        .collect::<Result<_, _>>()?,
+        opaque: Regex::new(r"[A-Za-z0-9+/=_-]{40,}")?,
     })
 }
 
 /// Scrubs one line. Also truncates to `MAX_LINE_CHARS` characters.
 pub fn scrub_line(line: &str) -> String {
-    let p = patterns();
+    // Literal patterns always compile; should that ever change, drop the line rather than leak it.
+    let Some(p) = patterns() else {
+        return REDACTED.to_string();
+    };
     let keep_key = |caps: &regex::Captures| format!("{}{}{REDACTED}", &caps[1], &caps[2]);
     let mut out = p.header.replace_all(line, keep_key).into_owned();
     out = p.keyed.replace_all(&out, keep_key).into_owned();

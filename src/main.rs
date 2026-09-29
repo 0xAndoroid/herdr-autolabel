@@ -54,7 +54,7 @@ fn parse_args() -> Result<Args, String> {
             "--force" | "-f" => force = true,
             "-h" | "--help" => return Err(USAGE.into()),
             s if s.starts_with("--socket=") => {
-                socket = Some(PathBuf::from(&s["--socket=".len()..]))
+                socket = Some(PathBuf::from(&s["--socket=".len()..]));
             }
             other => return Err(format!("unknown argument {other:?}\n{USAGE}")),
         }
@@ -214,7 +214,7 @@ fn status_json(paths: &Paths) -> serde_json::Value {
         "state_dir": paths.state_dir,
         "config_file": paths.config_file(),
         "log_file": paths.log_file(),
-        "provider": provider.as_ref().map(|p| p.kind.name()).unwrap_or("none"),
+        "provider": provider.as_ref().map_or("none", |p| p.kind.name()),
         "model": provider.as_ref().map(|p| p.model.clone()),
         "last_pass": last,
     })
@@ -340,27 +340,23 @@ fn cmd_daemon(paths: &Paths) -> i32 {
 }
 
 fn cmd_stop(paths: &Paths) -> i32 {
-    match running_pid(paths) {
-        Some(pid) => {
-            // SAFETY: plain SIGTERM to a pid we recorded ourselves.
-            let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
-            if rc != 0 {
-                eprintln!("kill {pid} failed: {}", std::io::Error::last_os_error());
-                return 1;
-            }
-            let deadline = Instant::now() + Duration::from_secs(15);
-            while Instant::now() < deadline && running_pid(paths) == Some(pid) {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            let stopped = running_pid(paths) != Some(pid);
-            println!("{}", json!({"stopped": stopped, "pid": pid}));
-            i32::from(!stopped)
-        }
-        None => {
-            println!("{}", json!({"stopped": false, "reason": "not running"}));
-            0
-        }
+    let Some(pid) = running_pid(paths) else {
+        println!("{}", json!({"stopped": false, "reason": "not running"}));
+        return 0;
+    };
+    // SAFETY: plain SIGTERM to a pid we recorded ourselves.
+    let rc = unsafe { libc::kill(pid, libc::SIGTERM) };
+    if rc != 0 {
+        eprintln!("kill {pid} failed: {}", std::io::Error::last_os_error());
+        return 1;
     }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline && running_pid(paths) == Some(pid) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let stopped = running_pid(paths) != Some(pid);
+    println!("{}", json!({"stopped": stopped, "pid": pid}));
+    i32::from(!stopped)
 }
 
 fn cmd_once(paths: &Paths, force: bool) -> i32 {

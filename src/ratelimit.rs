@@ -87,6 +87,8 @@ impl RateLimiter {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use super::*;
 
     fn limiter(name: &str, capacity: u32) -> RateLimiter {

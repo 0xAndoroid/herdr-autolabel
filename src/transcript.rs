@@ -265,6 +265,8 @@ fn typed_text(content: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use super::*;
 
     fn user(content: &str, extra: &str) -> String {

@@ -37,12 +37,10 @@ impl Paths {
         let home = herdr::home_dir();
         let state_dir = std::env::var_os("HERDR_PLUGIN_STATE_DIR")
             .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".local/state/herdr-autolabel"));
+            .map_or_else(|| home.join(".local/state/herdr-autolabel"), PathBuf::from);
         let config_dir = std::env::var_os("HERDR_PLUGIN_CONFIG_DIR")
             .filter(|p| !p.is_empty())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(".config/herdr-autolabel"));
+            .map_or_else(|| home.join(".config/herdr-autolabel"), PathBuf::from);
         Self {
             socket,
             state_dir,
@@ -224,8 +222,7 @@ impl Daemon {
             self.paths.socket.display(),
             self.provider
                 .as_ref()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| "none".into()),
+                .map_or_else(|| "none".into(), |p| p.to_string()),
             self.config.interval_secs
         );
         loop {
@@ -458,18 +455,10 @@ impl Daemon {
                 if let Some(cached) = self.cache.get(fp) {
                     (cached, Source::Cache, true)
                 } else if let Some(provider) = self.provider.clone() {
-                    if !self
+                    if self
                         .limiter
                         .try_acquire(&format!("{}:{id}", self.paths.socket.display()))
                     {
-                        log_debug!("{id}: llm rate-limited; keeping previous label");
-                        // Keep the previous label (or the fallback when there is none) and don't
-                        // record the fingerprint so the next pass retries.
-                        match self.labels.get(&id).map(|l| l.label.clone()) {
-                            Some(previous) => (previous, Source::RateLimited, false),
-                            None => (fallback, Source::Fallback, false),
-                        }
-                    } else {
                         // The screen is read only now: it never enters the fingerprint, so
                         // unchanged panes cost one process_info call and herdr's read-time
                         // side effects (alternate-screen history harvest) stay off idle panes.
@@ -517,6 +506,14 @@ impl Daemon {
                                 log_warn!("{id}: llm failed ({e}); fallback {fallback:?}");
                                 (fallback, Source::Fallback, true)
                             }
+                        }
+                    } else {
+                        log_debug!("{id}: llm rate-limited; keeping previous label");
+                        // Keep the previous label (or the fallback when there is none) and don't
+                        // record the fingerprint so the next pass retries.
+                        match self.labels.get(&id).map(|l| l.label.clone()) {
+                            Some(previous) => (previous, Source::RateLimited, false),
+                            None => (fallback, Source::Fallback, false),
                         }
                     }
                 } else {
@@ -632,7 +629,7 @@ impl Daemon {
                 spaces::Ownership::Default => {
                     if state.applied.is_some() || state.original != ws.label {
                         state.applied = None;
-                        state.original = ws.label.clone();
+                        state.original.clone_from(&ws.label);
                         dirty = true;
                     }
                 }
@@ -847,6 +844,8 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use super::*;
 
     /// Joins the mock server and removes its state dir (only once the daemon is done with it).

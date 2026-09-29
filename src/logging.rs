@@ -46,8 +46,7 @@ pub(crate) use {log_debug, log_info, log_warn};
 pub fn timestamp() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |d| d.as_secs());
     let days = secs / 86_400;
     let rem = secs % 86_400;
     let (y, m, d) = civil_from_days(days as i64);

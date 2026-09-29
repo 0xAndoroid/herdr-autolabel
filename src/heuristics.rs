@@ -210,8 +210,7 @@ pub fn agent_of(proc_: &Proc) -> Option<String> {
 pub fn basename(p: &str) -> String {
     Path::new(p)
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string())
+        .map_or_else(|| p.to_string(), |s| s.to_string_lossy().into_owned())
 }
 
 pub fn directory_name(cwd: &str) -> String {
@@ -418,7 +417,7 @@ fn known_process_label(proc_: &Proc) -> Option<String> {
             let mut pos = positionals(args).into_iter();
             let first = pos.next();
             match first {
-                Some("run") | Some("exec") | Some("x") | Some("dlx") => {
+                Some("run" | "exec" | "x" | "dlx") => {
                     Some(two(&cmd, pos.next().map(basename).as_deref()))
                 }
                 Some(sub) if cmd == "npx" || cmd == "bunx" => Some(two(&cmd, Some(&basename(sub)))),
@@ -430,7 +429,7 @@ fn known_process_label(proc_: &Proc) -> Option<String> {
             let mut pos = positionals(args).into_iter();
             match pos.next() {
                 Some("run") => {
-                    let run = args.iter().position(|a| a == "run").unwrap();
+                    let run = args.iter().position(|a| a == "run")?;
                     let rest: Vec<&str> = args[run + 1..].iter().map(String::as_str).collect();
                     if rest.is_empty() {
                         Some("uv run".into())
@@ -533,6 +532,8 @@ pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used, clippy::panic)]
+
     use super::*;
 
     fn facts(argv: &[&str], cwd: &str, branch: Option<&str>) -> PaneFacts {

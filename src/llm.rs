@@ -1,6 +1,7 @@
 //! LLM labelling: provider selection, prompt construction, request, post-processing.
 
 use std::fmt;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -248,15 +249,15 @@ pub fn user_message(ctx: &Context, max_chars: usize) -> String {
 }
 
 fn pr_mentions(lines: &[String]) -> Vec<String> {
-    let re = regex::Regex::new(r"(?i)\bPR\s*#?(\d+)|/pull/(\d+)").unwrap();
+    static RE: OnceLock<Option<regex::Regex>> = OnceLock::new();
+    let Some(re) = RE.get_or_init(|| regex::Regex::new(r"(?i)\bPR\s*#?(\d+)|/pull/(\d+)").ok())
+    else {
+        return Vec::new();
+    };
     let mut seen = Vec::new();
     for l in lines {
         for c in re.captures_iter(l) {
-            let n = c
-                .get(1)
-                .or_else(|| c.get(2))
-                .map(|m| m.as_str())
-                .unwrap_or("");
+            let n = c.get(1).or_else(|| c.get(2)).map_or("", |m| m.as_str());
             let s = format!("PR {n}");
             if !n.is_empty() && !seen.contains(&s) {
                 seen.push(s);
@@ -411,6 +412,8 @@ pub fn postprocess(raw: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::unwrap_used)]
+
     use super::*;
 
     #[test]
