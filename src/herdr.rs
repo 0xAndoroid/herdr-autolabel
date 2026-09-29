@@ -452,6 +452,9 @@ mod tests {
 
     #[test]
     fn multi_chunk_frame_survives_peer_closing_first() {
+        // herdr writes the response and closes immediately; a frame larger than one read
+        // buffer must still be assembled (re-arming SO_RCVTIMEO here fails with EINVAL on
+        // macOS once the peer is gone).
         let (mut client, mut server) = UnixStream::pair().unwrap();
         client.set_read_timeout(Some(TIMEOUT)).unwrap();
         let body = format!("{{\"pad\":\"{}\"}}", "x".repeat(6_000));

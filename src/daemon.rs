@@ -396,6 +396,8 @@ impl Daemon {
                 .map(|p| {
                     let mut v = vec![p.command()];
                     v.extend(p.argv.iter().skip(1).take(2).cloned());
+                    // A command's phases (`docker build`, then `docker logs`) relabel it; an
+                    // agent's tool calls do not.
                     if let Some(c) = child.as_ref().filter(|_| agent_kind.is_none()) {
                         v.push(c.command());
                         v.extend(c.argv.iter().skip(1).take(1).cloned());
@@ -490,6 +492,8 @@ impl Daemon {
                         }
                     } else {
                         log_debug!("{id}: llm rate-limited; keeping previous label");
+                        // Keep the previous label (or the fallback when there is none) and don't
+                        // record the fingerprint so the next pass retries.
                         match self.labels.get(&id).map(|l| l.label.clone()) {
                             Some(previous) => (previous, Source::RateLimited, false),
                             None => (fallback, Source::Fallback, false),
@@ -638,7 +642,7 @@ impl Daemon {
             // Pane labelling (and its LLM calls) ran after the snapshot; recheck the name.
             let current = match self.client.workspace(id) {
                 Ok(w) => w,
-                Err(herdr::Error::Api { .. }) => continue,
+                Err(herdr::Error::Api { .. }) => continue, // closed meanwhile
                 Err(e) => return Err(e),
             };
             if current.label != ws.label {
@@ -725,6 +729,9 @@ impl Daemon {
             .as_ref()
             .is_some_and(|title| !title.is_empty() && self.applied.get(id) != Some(title))
         {
+            // A title we did not apply: either ours from a previous daemon run (cleared
+            // once via `clear_if_ours`, after which the pane is labelled again) or another
+            // source's, which keeps winning for as long as it is present.
             Some(Source::SkippedTitle)
         } else {
             None

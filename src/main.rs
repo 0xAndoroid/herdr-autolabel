@@ -275,7 +275,7 @@ fn cmd_start(paths: &Paths) -> i32 {
             return 1;
         }
     };
-    drop(child);
+    drop(child); // Not waited on: it is reparented once we exit.
     let deadline = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < deadline && running_pid(paths).is_none() {
         std::thread::sleep(Duration::from_millis(50));
