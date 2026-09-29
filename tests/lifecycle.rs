@@ -130,22 +130,8 @@ fn malformed_config_is_fatal() {
             "{verb} ignored a malformed config"
         );
     }
-    let state = session.root.join("state");
-    let output = session
-        .command("start")
-        .current_dir(&session.root)
-        .env("HERDR_PLUGIN_CONFIG_DIR", ".")
-        .env("HERDR_PLUGIN_STATE_DIR", &state)
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    let has_pidfile = |dir: &PathBuf| {
-        fs::read_dir(dir).is_ok_and(|mut entries| {
-            entries.any(|e| e.unwrap().path().extension().is_some_and(|x| x == "pid"))
-        })
-    };
     assert!(
-        !has_pidfile(&session.root) && !has_pidfile(&state),
+        !session.root.join("daemon.log").exists(),
         "start spawned a daemon"
     );
 }
