@@ -7,11 +7,13 @@ use regex::Regex;
 pub const MAX_LINES: usize = 40;
 pub const MAX_LINE_CHARS: usize = 300;
 const REDACTED: &str = "[redacted]";
+const KEY: &str =
+    "[A-Za-z0-9_-]*(?:token|api[_-]?key|secret|password|passwd|authorization|cookie)[A-Za-z0-9_-]*";
 
 struct Patterns {
     /// `Authorization: …` / `Cookie: …` headers: everything after the colon is replaced.
     header: Regex,
-    /// `key = value` style; group 1 is the key name (kept), the value is replaced.
+    /// `key = value` or `--key value`; group 1 (key and separator) is kept, the value is replaced.
     keyed: Regex,
     whole: Vec<Regex>,
     opaque: Regex,
@@ -24,10 +26,10 @@ fn patterns() -> Option<&'static Patterns> {
 
 fn compile() -> Result<Patterns, regex::Error> {
     Ok(Patterns {
-        header: Regex::new(r"(?i)\b((?:proxy-)?authorization|(?:set-)?cookie)(\s*:\s*).+$")?,
-        keyed: Regex::new(
-            r#"(?i)\b([A-Za-z0-9_-]*(?:token|api[_-]?key|secret|password|passwd|authorization|cookie)[A-Za-z0-9_-]*)(["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#,
-        )?,
+        header: Regex::new(r"(?i)(\b(?:(?:proxy-)?authorization|(?:set-)?cookie)\s*:\s*).+$")?,
+        keyed: Regex::new(&format!(
+            r#"(?i)(\B-{KEY}\s+|\b{KEY}["']?\s*[=:]\s*)(?:"(?:\\.|[^"\\])*(?:"|$)|'[^']*(?:'|$)|[^\s'",&]+)"#
+        ))?,
         whole: [
             r#"(?i)\bbearer\s+[^\s'"]+"#,
             r"sk-ant-\S+",
@@ -52,7 +54,7 @@ pub fn scrub_line(line: &str) -> String {
     let Some(p) = patterns() else {
         return REDACTED.to_string();
     };
-    let keep_key = |caps: &regex::Captures| format!("{}{}{REDACTED}", &caps[1], &caps[2]);
+    let keep_key = |caps: &regex::Captures| format!("{}{REDACTED}", &caps[1]);
     let mut out = p.header.replace_all(line, keep_key).into_owned();
     out = p.keyed.replace_all(&out, keep_key).into_owned();
     for re in &p.whole {
@@ -136,6 +138,26 @@ mod tests {
     }
 
     #[test]
+    fn space_separated_secret_flags() {
+        for (line, want) in [
+            ("worker --password hunter2", "worker --password [redacted]"),
+            (
+                r#"worker --password "hunter two" --verbose"#,
+                "worker --password [redacted] --verbose",
+            ),
+            (
+                "cli --api-key sk-live-abcdef --region us",
+                "cli --api-key [redacted] --region us",
+            ),
+            ("login --token 'abc def'", "login --token [redacted]"),
+            (r#"login --token "abc def"#, "login --token [redacted]"),
+            ("--password=hunter2", "--password=[redacted]"),
+        ] {
+            assert_eq!(scrub_line(line), want, "{line}");
+        }
+    }
+
+    #[test]
     fn bearer() {
         assert_eq!(
             scrub_line("curl -H 'Bearer abcdef' x"),
@@ -188,6 +210,9 @@ mod tests {
             "review PR 1283 for the auth refactor",
             "git checkout feat/moving-button",
             "The token count is 42",
+            "the token count is 42",
+            "password reset flow works",
+            "rotate the secret weekly",
             "❯ ",
         ] {
             assert_eq!(scrub_line(s), s);
