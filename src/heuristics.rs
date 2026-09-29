@@ -385,13 +385,6 @@ fn known_process_label(proc_: &Proc) -> Option<String> {
                     two(&base, Some(module.rsplit('.').next().unwrap_or(module)))
                 });
             }
-            if cmd == "bun"
-                && args
-                    .first()
-                    .is_some_and(|a| !a.ends_with(".ts") && !a.ends_with(".js"))
-            {
-                return Some(two("bun", first_positional(args, &[])));
-            }
             let script =
                 first_positional(args, &["-c", "-W", "-X", "-e", "-r", "--require"]).map(basename);
             Some(two(&base, script.as_deref()))
