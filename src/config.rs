@@ -50,7 +50,7 @@ impl Config {
                 if let Some(value) = values.remove(stringify!($field)) {
                     match value.try_into() {
                         Ok(value) => config.$field = value,
-                        Err(e) => crate::logging::log_warn!("config {}: {e}; using default", stringify!($field)),
+                        Err(e) => return Err(format!("{}: {e}", stringify!($field))),
                     }
                 }
             )+};
@@ -175,9 +175,9 @@ mod tests {
 
     #[test]
     fn pane_and_space_toggles() {
-        let c = Config::parse("label_panes = false\nlabel_spaces = \"yes\"\n").unwrap();
+        let c = Config::parse("label_panes = false\n").unwrap();
         assert!(!c.label_panes);
-        assert!(c.label_spaces, "invalid value keeps the default");
+        assert!(c.label_spaces);
     }
 
     #[test]
@@ -193,10 +193,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_fields_preserve_valid_settings() {
-        let c = Config::parse("provider = \"none\"\nmax_chars = \"bad\"\ninterval_secs = 0\nllm_per_pane_secs = 0\nllm_global_per_min = 100").unwrap();
+    fn out_of_range_fields_are_clamped() {
+        let c = Config::parse("provider = \"none\"\ninterval_secs = 0\nllm_per_pane_secs = 0\nllm_global_per_min = 100").unwrap();
         assert_eq!(c.provider, "none");
-        assert_eq!(c.max_chars, 25);
         assert_eq!(c.interval_secs, 1);
         assert_eq!(c.llm_per_pane_secs, 15);
         assert_eq!(c.llm_global_per_min, 6);
@@ -206,6 +205,17 @@ mod tests {
     fn missing_file_is_defaults() {
         let c = Config::load(Path::new("/nonexistent/herdr-autolabel/config.toml")).unwrap();
         assert_eq!(c, Config::default());
+    }
+
+    #[test]
+    fn malformed_toml_is_an_error() {
+        assert!(Config::parse("deny = [\"*\"\n").is_err());
+    }
+
+    #[test]
+    fn wrong_typed_fields_are_an_error() {
+        assert!(Config::parse("provider = [\"none\"]").is_err());
+        assert!(Config::parse("max_chars = \"bad\"").is_err());
     }
 
     #[test]
