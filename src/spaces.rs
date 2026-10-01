@@ -1,91 +1,65 @@
-//! Space (workspace) labels: one label per sidebar space derived from the labels of its panes,
-//! with hysteresis so a space does not flip on a transient command, and ownership tracking so
-//! a name the user typed is never overwritten and our names are restored on stop.
+//! Workspace context, fallback names, and ownership of applied names.
 
 use std::collections::HashMap;
+use std::hash::Hasher;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fingerprint::Fnv;
 use crate::label;
 
 /// Passes a new candidate must persist before a space that already has a label is renamed.
 pub const HYSTERESIS_PASSES: u32 = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PaneSummary {
     pub label: String,
-    pub agent: bool,
-    /// A command runs in the pane, or someone named it: the label says what is done, not only
-    /// where.
-    pub busy: bool,
-    /// The label is a whole space name already (LLM-written, project included as far as it
-    /// helps); no project is put in front of it.
-    pub whole: bool,
-    /// Repository checkout name, else cwd basename.
     pub project: Option<String>,
+    pub context: String,
+    pub fingerprint: u64,
 }
 
-/// Derives the space label from the primary pane — the first agent pane, else the first busy
-/// pane, else the first labelled pane; focus plays no part, so switching panes never renames
-/// the space — within `max_chars` in total:
-/// - a whole label (LLM-written) is used as is;
-/// - otherwise `<project>: <activity>`, the project being `worktree` (herdr's repository name
-///   for a worktree space) when set, else the project named by most panes (ties go to the
-///   first pane), and the activity the primary pane's label cut to whole words in the room
-///   the project leaves.
-///
-/// The project alone when the activity repeats it (idle shells at the repository root) or when
-/// not even its first word fits; the activity alone when no pane has a cwd.
-pub fn aggregate(
-    panes: &[PaneSummary],
-    worktree: Option<&str>,
-    max_chars: usize,
-) -> Option<String> {
-    let labelled: Vec<&PaneSummary> = panes.iter().filter(|p| !p.label.is_empty()).collect();
-    let primary = labelled
+pub fn fallback(panes: &[(&str, &PaneSummary)], max_chars: usize) -> Option<String> {
+    let mut labels: Vec<&str> = panes
         .iter()
-        .find(|p| p.agent)
-        .or_else(|| labelled.iter().find(|p| p.busy))
-        .or(labelled.first())?;
-    if primary.whole {
-        return Some(label::truncate_words(&primary.label, max_chars));
-    }
-    let project = worktree
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .or_else(|| dominant_project(&labelled));
-    let Some(project) = project else {
-        return Some(label::truncate_words(&primary.label, max_chars));
+        .map(|(_, p)| p.label.as_str())
+        .filter(|s| !s.is_empty() && *s != "shell")
+        .collect();
+    labels.sort_unstable();
+    labels.dedup();
+    let name = match labels.as_slice() {
+        [] if panes.is_empty() => return None,
+        [] => "shell",
+        [one] => one,
+        _ => "multiple tasks",
     };
-    let room = max_chars.saturating_sub(project.chars().count() + 2);
-    let first_word_fits = primary
-        .label
-        .split_whitespace()
-        .next()
-        .is_some_and(|w| w.chars().count() <= room);
-    let activity = label::truncate_words(&primary.label, room);
-    Some(if !first_word_fits || activity == project {
-        label::truncate_words(&project, max_chars)
-    } else {
-        format!("{project}: {activity}")
-    })
+    Some(label::truncate_words(name, max_chars))
 }
 
-fn dominant_project(panes: &[&PaneSummary]) -> Option<String> {
+pub fn fingerprint(panes: &[(&str, &PaneSummary)]) -> u64 {
+    let mut hash = Fnv::new();
+    hash.write(b"workspace\0");
+    for (id, pane) in panes {
+        hash.write(id.as_bytes());
+        hash.write_u8(0);
+        hash.write_u64(pane.fingerprint);
+        hash.write(pane.label.as_bytes());
+        hash.write_u8(0);
+    }
+    hash.finish()
+}
+
+pub fn dominant_project<'a>(panes: &[(&str, &'a PaneSummary)]) -> Option<&'a str> {
     let mut counts: Vec<(&str, usize)> = Vec::new();
-    for project in panes.iter().filter_map(|p| p.project.as_deref()) {
+    for project in panes.iter().filter_map(|(_, p)| p.project.as_deref()) {
         match counts.iter_mut().find(|(s, _)| *s == project) {
             Some((_, n)) => *n += 1,
             None => counts.push((project, 1)),
         }
     }
-    // `max_by_key` keeps the last maximum; reversed, that is the first project seen.
-    counts
-        .iter()
-        .rev()
-        .max_by_key(|(_, n)| *n)
-        .map(|(p, _)| p.to_string())
+    // max_by_key keeps the last tie; reversing selects the first pane's project.
+    counts.iter().rev().max_by_key(|(_, n)| *n).map(|(p, _)| *p)
 }
 
 /// Per-space state, persisted so a restarted daemon still recognises its own names.
@@ -214,151 +188,32 @@ mod tests {
 
     use super::*;
 
-    fn pane(label: &str, agent: bool, busy: bool, project: Option<&str>) -> PaneSummary {
-        PaneSummary {
-            label: label.into(),
-            agent,
-            busy,
-            whole: false,
-            project: project.map(str::to_string),
-        }
-    }
-
     #[test]
-    fn whole_labels_are_used_as_they_are() {
-        let panes = [
-            pane("nvim foo.rs", false, true, Some("herdr-autolabel")),
-            PaneSummary {
-                whole: true,
-                ..pane(
-                    "herdr: fix label rules",
-                    true,
-                    true,
-                    Some("herdr-autolabel"),
-                )
-            },
-        ];
+    fn fallback_and_fingerprint_include_every_pane() {
+        let first = PaneSummary {
+            label: "fix tests".into(),
+            project: Some("jolt".into()),
+            fingerprint: 1,
+            ..Default::default()
+        };
+        let mut second = PaneSummary {
+            label: "review PR 25".into(),
+            project: Some("jolt".into()),
+            fingerprint: 2,
+            ..Default::default()
+        };
+        let panes = [("p1", &first), ("p2", &second)];
+        assert_eq!(fallback(&panes, 25).as_deref(), Some("multiple tasks"));
+        assert_eq!(dominant_project(&panes), Some("jolt"));
+        let before = fingerprint(&panes);
+        second.fingerprint = 3;
+        assert_ne!(before, fingerprint(&[("p1", &first), ("p2", &second)]));
+        assert_ne!(before, fingerprint(&[("p1", &first)]));
         assert_eq!(
-            aggregate(&panes, Some("herdr-autolabel"), 25).as_deref(),
-            Some("herdr: fix label rules")
+            fallback(&[("p1", &first)], 25).as_deref(),
+            Some("fix tests")
         );
-        let panes = [PaneSummary {
-            whole: true,
-            ..pane("relocate worktrees to wt", true, true, Some("dev"))
-        }];
-        assert_eq!(
-            aggregate(&panes, None, 25).as_deref(),
-            Some("relocate worktrees to wt")
-        );
-    }
-
-    #[test]
-    fn project_then_activity() {
-        let panes = [pane("cargo build", false, true, Some("jolt"))];
-        assert_eq!(
-            aggregate(&panes, None, 24).as_deref(),
-            Some("jolt: cargo build")
-        );
-        let panes = [pane("ssh mini", false, true, None)];
-        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("ssh mini"));
-        let panes = [pane("pika", false, false, Some("pika"))];
-        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("pika"));
-        assert_eq!(aggregate(&[], None, 24), None);
-        assert_eq!(
-            aggregate(&[pane("", false, true, Some("pika"))], None, 24),
-            None
-        );
-    }
-
-    #[test]
-    fn worktree_names_the_project() {
-        let panes = [pane("cargo test", false, true, Some("feat-a"))];
-        assert_eq!(
-            aggregate(&panes, Some("jolt"), 24).as_deref(),
-            Some("jolt: cargo test")
-        );
-        assert_eq!(
-            aggregate(&panes, Some(""), 24).as_deref(),
-            Some("feat-a: cargo test")
-        );
-    }
-
-    #[test]
-    fn first_agent_pane_sets_the_activity() {
-        let panes = [
-            pane("feat/x", false, false, Some("pika")),
-            pane("nvim foo.rs", false, true, Some("pika")),
-            pane("fixing auth tests", true, true, Some("pika")),
-        ];
-        assert_eq!(
-            aggregate(&panes, None, 24).as_deref(),
-            Some("pika: fixing auth tests")
-        );
-        let panes = [
-            pane("wt switch", true, true, Some("pika")),
-            pane("watching CI run", true, true, Some("pika")),
-        ];
-        assert_eq!(
-            aggregate(&panes, None, 24).as_deref(),
-            Some("pika: wt switch")
-        );
-    }
-
-    #[test]
-    fn dominant_project_then_busy_pane_then_first() {
-        let panes = [
-            pane("crates", false, false, Some("pika")),
-            pane("htop", false, true, Some("jolt")),
-            pane("cargo test", false, true, Some("pika")),
-        ];
-        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("pika: htop"));
-        let panes = [
-            pane("sub", false, false, Some("jolt")),
-            pane("crates", false, false, Some("pika")),
-        ];
-        assert_eq!(aggregate(&panes, None, 24).as_deref(), Some("jolt: sub"));
-    }
-
-    #[test]
-    fn whole_label_is_capped_at_max_chars() {
-        let panes = [pane("delegating keccak PR review", true, true, Some("web"))];
-        assert_eq!(
-            aggregate(&panes, None, 22).as_deref(),
-            Some("web: delegating keccak")
-        );
-        let panes = [pane(
-            "cargo build",
-            false,
-            true,
-            Some("herdr-autolabel-plugin"),
-        )];
-        assert_eq!(
-            aggregate(&panes, None, 22).as_deref(),
-            Some("herdr-autolabel-plugin")
-        );
-        let panes = [pane("cargo build", false, true, Some("herdr-autolabel"))];
-        assert_eq!(
-            aggregate(&panes, None, 22).as_deref(),
-            Some("herdr-autolabel: cargo")
-        );
-        let panes = [pane(
-            "x",
-            false,
-            true,
-            Some("a-project-name-past-the-cap-x"),
-        )];
-        let out = aggregate(&panes, None, 22).unwrap();
-        assert!(out.chars().count() <= 22, "{out}");
-        let panes = [pane(
-            "a long label without a cwd anywhere",
-            false,
-            true,
-            None,
-        )];
-        assert_eq!(
-            aggregate(&panes, None, 22).as_deref(),
-            Some("a long label without")
-        );
+        assert_eq!(fallback(&[], 25), None);
     }
 
     #[test]

@@ -11,6 +11,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 pub const SOURCE: &str = "plugin:autolabel";
+// Herdr replaces presentation fields per source; identity reports must not erase titles.
+pub const IDENTITY_SOURCE: &str = "plugin:autolabel:identity";
+pub const FOLDER_TOKEN: &str = "autolabel_folder";
+pub const BRANCH_TOKEN: &str = "autolabel_branch";
 const TIMEOUT: Duration = Duration::from_secs(5);
 const RETRY_DELAY: Duration = Duration::from_millis(25);
 
@@ -115,6 +119,7 @@ pub struct WorkspaceInfo {
     pub focused: bool,
     pub pane_count: usize,
     pub worktree: Option<WorkspaceWorktree>,
+    pub tokens: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -291,6 +296,40 @@ impl Client {
             "pane.report_metadata",
             json!({"pane_id": pane_id, "source": SOURCE, "clear_title": true}),
         )?;
+        Ok(())
+    }
+
+    pub fn set_pane_identity(&self, pane_id: &str, folder: &str, pika: bool) -> Result<(), Error> {
+        let mut params = json!({"pane_id": pane_id, "source": IDENTITY_SOURCE, "tokens": {FOLDER_TOKEN: folder}});
+        if pika {
+            params["display_agent"] = json!("pika TUI");
+        } else {
+            params["clear_display_agent"] = json!(true);
+        }
+        self.call("pane.report_metadata", params)?;
+        crate::logging::log_debug!(
+            "{pane_id}: folder -> {:?}",
+            crate::scrub::scrub_line(folder)
+        );
+        Ok(())
+    }
+
+    pub fn set_workspace_location(
+        &self,
+        workspace_id: &str,
+        folder: &str,
+        branch: &str,
+    ) -> Result<(), Error> {
+        self.call(
+            "workspace.report_metadata",
+            json!({"workspace_id": workspace_id, "source": SOURCE,
+                "tokens": {FOLDER_TOKEN: folder, BRANCH_TOKEN: branch}}),
+        )?;
+        crate::logging::log_debug!(
+            "{workspace_id}: location -> {:?} / {:?}",
+            crate::scrub::scrub_line(folder),
+            crate::scrub::scrub_line(branch)
+        );
         Ok(())
     }
 

@@ -97,6 +97,11 @@ fn main() {
 
 fn load_config(paths: &Paths) -> Option<config::Config> {
     config::Config::load(&paths.config_file())
+        .inspect(|config| {
+            if config.debug {
+                logging::enable_debug();
+            }
+        })
         .inspect_err(|e| eprintln!("config error: {e}"))
         .ok()
 }

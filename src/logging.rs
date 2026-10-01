@@ -23,6 +23,10 @@ pub fn debug_enabled() -> bool {
     DEBUG.load(Ordering::Relaxed)
 }
 
+pub fn enable_debug() {
+    DEBUG.store(true, Ordering::Relaxed);
+}
+
 pub fn emit(level: &str, msg: &str) {
     if TO_STDERR.load(Ordering::Relaxed) {
         eprintln!("{} {level:<5} {msg}", timestamp());

@@ -44,8 +44,6 @@ pub struct PaneFacts {
 pub enum Decision {
     /// Deterministic label; no LLM needed.
     Label(String),
-    /// Deterministic and already a whole name: spaces use it as it is, without a project.
-    Whole(String),
     /// Ask the LLM; use `fallback` when it fails or is unavailable.
     Llm { fallback: String },
 }
@@ -233,21 +231,7 @@ pub fn running_child(procs: &[Proc], typed: &Proc) -> Option<Proc> {
         .cloned()
 }
 
-fn is_default_branch(branch: &str) -> bool {
-    matches!(branch, "main" | "master" | "trunk" | "develop")
-}
-
-/// Worktree checkouts are named `<repo>.<branch>` (worktrunk's default template), so the
-/// project is the part before the first dot; a leading dot (`.dotfiles`) belongs to the name.
-pub fn project_name(dir: &str) -> &str {
-    dir.char_indices()
-        .skip(1)
-        .find(|&(_, c)| c == '.')
-        .map_or(dir, |(i, _)| &dir[..i])
-}
-
-/// Where a pane's work happens: the repository checkout name, else the cwd basename, without
-/// a worktree suffix. `None` without a cwd.
+/// Main repository name, else the cwd basename. `None` without a cwd.
 pub fn project(cwd: &str) -> Option<String> {
     let cwd = cwd.trim_end_matches('/');
     if cwd.is_empty() {
@@ -255,22 +239,8 @@ pub fn project(cwd: &str) -> Option<String> {
     }
     crate::git::repo_basename(Path::new(cwd))
         .or_else(|| Some(directory_name(cwd)))
-        .map(|d| project_name(&d).to_string())
+        .map(|d| d.trim_start_matches('.').to_string())
         .filter(|s| !s.is_empty())
-}
-
-fn idle_label(facts: &PaneFacts) -> String {
-    match &facts.branch {
-        Some(b) if !b.is_empty() && !is_default_branch(b) => b.clone(),
-        _ => {
-            let base = directory_name(&facts.cwd);
-            if base.is_empty() {
-                "shell".into()
-            } else {
-                project_name(&base).to_string()
-            }
-        }
-    }
 }
 
 fn first_positional<'a>(args: &'a [String], skip_with_value: &[&str]) -> Option<&'a str> {
@@ -353,7 +323,12 @@ fn known_process_label(proc_: &Proc) -> Option<String> {
             let host = host.rsplit('@').next().unwrap_or(host);
             let host = host.strip_prefix("ssh://").unwrap_or(host);
             let host = host.split(':').next().unwrap_or(host);
-            Some(two("ssh", Some(host)))
+            let host = if host.eq_ignore_ascii_case("macmini") {
+                "Mac Mini"
+            } else {
+                host
+            };
+            Some(two("SSH", Some(host)))
         }
         "tail" => {
             let file = positionals(args).last().map(|s| basename(s));
@@ -488,19 +463,22 @@ pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
 
     if let Some(agent) = agent_kind {
         if NAMED_AGENTS.contains(&agent.as_str()) {
-            return Decision::Whole(fin(&agent));
+            return Decision::Label(fin(&agent));
         }
-        let fallback = fin(&format!("{agent} {}", idle_label(facts)));
+        let fallback = fin(if facts.agent_status == "working" {
+            "working"
+        } else {
+            "ready"
+        });
         return Decision::Llm { fallback };
     }
     let Some(proc_) = &facts.fg else {
-        return Decision::Label(fin(&idle_label(facts)));
+        return Decision::Label(fin("shell"));
     };
     if is_shell(&proc_.command()) {
-        return Decision::Label(fin(&idle_label(facts)));
+        return Decision::Label(fin("shell"));
     }
     match known_process_label(proc_) {
-        Some(l) if l.starts_with("ssh ") => Decision::Whole(fin(&l)),
         Some(l) => Decision::Label(fin(&l)),
         None => Decision::Llm {
             fallback: fin(&generic_label(proc_)),
@@ -530,7 +508,7 @@ mod tests {
 
     fn label_of(argv: &[&str], cwd: &str, branch: Option<&str>) -> String {
         match decide(&facts(argv, cwd, branch), 24) {
-            Decision::Label(l) | Decision::Whole(l) => l,
+            Decision::Label(l) => l,
             Decision::Llm { fallback } => {
                 panic!("expected heuristic label, got LLM (fallback {fallback})")
             }
@@ -538,36 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn project_drops_worktree_suffix_and_keeps_leading_dot() {
-        assert_eq!(project_name("jolt.keccak-xorrotl-fusion"), "jolt");
-        assert_eq!(project_name(".dotfiles"), ".dotfiles");
-        assert_eq!(project_name(".dotfiles.wip"), ".dotfiles");
-        assert_eq!(project_name("herdr-autolabel"), "herdr-autolabel");
-        assert_eq!(project("/x/jolt.keccak/").as_deref(), Some("jolt"));
+    fn folders_are_separate_from_idle_task_names() {
+        assert_eq!(project("/x/.dotfiles/").as_deref(), Some("dotfiles"));
+        assert_eq!(project("/x/app.web/").as_deref(), Some("app.web"));
         assert_eq!(project(""), None);
-        assert_eq!(label_of(&["zsh"], "/x/jolt.keccak", Some("main")), "jolt");
-        assert_eq!(label_of(&["zsh"], "/x/.dotfiles", None), ".dotfiles");
-    }
-
-    #[test]
-    fn home_directory_is_named_home() {
         let home = crate::herdr::home_dir();
-        let cwd = home.to_str().unwrap();
-        for cwd in [cwd.to_string(), format!("{cwd}/")] {
-            assert_eq!(directory_name(&cwd), "home");
-            assert_eq!(label_of(&["zsh"], &cwd, None), "home");
-            assert_eq!(project(&cwd).as_deref(), Some("home"));
-        }
-        let child = home.join("Downloads");
-        assert_eq!(
-            label_of(&["zsh"], child.to_str().unwrap(), None),
-            "Downloads"
-        );
-        let namesake = home.join("dev").join(home.file_name().unwrap());
-        assert_eq!(
-            label_of(&["zsh"], namesake.to_str().unwrap(), None),
-            project_name(&basename(cwd))
-        );
+        assert_eq!(project(home.to_str().unwrap()).as_deref(), Some("home"));
+        assert_eq!(label_of(&["zsh"], "/x/.dotfiles", Some("feat/x")), "shell");
     }
 
     #[test]
@@ -577,17 +532,17 @@ mod tests {
                 &[],
                 "/Users/me/dev/herdr-autolabel",
                 Some("feat/daemon"),
-                "feat/daemon",
+                "shell",
             ),
             (
                 &["-zsh"],
                 "/Users/me/dev/herdr-autolabel",
                 Some("feat/daemon"),
-                "feat/daemon",
+                "shell",
             ),
-            (&["zsh"], "/Users/me/Downloads", None, "Downloads"),
-            (&["zsh"], "/Users/me/dev/pika", Some("main"), "pika"),
-            (&["fish"], "/Users/me/dev/pika", Some("master"), "pika"),
+            (&["zsh"], "/Users/me/Downloads", None, "shell"),
+            (&["zsh"], "/Users/me/dev/pika", Some("main"), "shell"),
+            (&["fish"], "/Users/me/dev/pika", Some("master"), "shell"),
             (&["/bin/bash"], "/", None, "shell"),
             (
                 &["cargo", "build", "--release"],
@@ -608,12 +563,12 @@ mod tests {
                 None,
                 "vim hosts",
             ),
-            (&["ssh", "andoroid@host"], "/r", None, "ssh host"),
+            (&["ssh", "andoroid@host"], "/r", None, "SSH host"),
             (
                 &["ssh", "-p", "2222", "-i", "~/.ssh/id", "user@mini.local"],
                 "/r",
                 None,
-                "ssh mini.local",
+                "SSH mini.local",
             ),
             (&["vim"], "/r", None, "vim"),
             (&["node"], "/r", None, "node"),
@@ -621,8 +576,8 @@ mod tests {
             (&["tail", "-f"], "/r", None, "tail -f"),
             (&["less"], "/r", None, "less"),
             (&["man"], "/r", None, "man"),
-            (&["fish"], "/r", None, "r"),
-            (&["nu"], "/r", None, "r"),
+            (&["fish"], "/r", None, "shell"),
+            (&["nu"], "/r", None, "shell"),
             (&["nvim", "/src/claude/main.rs"], "/r", None, "nvim main.rs"),
             (
                 &["uv", "run", "python", "-m", "pytest"],
@@ -710,7 +665,7 @@ mod tests {
         assert_eq!(
             decide(&f, 24),
             Decision::Llm {
-                fallback: "claude pika".into()
+                fallback: "ready".into()
             }
         );
         f.fg = Some(Proc::new(&["zsh"]));
@@ -719,11 +674,11 @@ mod tests {
         assert_eq!(
             decide(&f, 24),
             Decision::Llm {
-                fallback: "codex pika".into()
+                fallback: "ready".into()
             }
         );
         f.agent = Some("pika".into());
-        assert_eq!(decide(&f, 24), Decision::Whole("pika".into()));
+        assert_eq!(decide(&f, 24), Decision::Label("pika".into()));
         let f = facts(
             &[
                 "node",
@@ -737,7 +692,7 @@ mod tests {
         assert_eq!(
             decide(&f, 24),
             Decision::Llm {
-                fallback: "claude y".into()
+                fallback: "ready".into()
             }
         );
         assert_eq!(
@@ -748,7 +703,12 @@ mod tests {
     }
 
     #[test]
-    fn ssh_panes_are_whole_names() {
+    fn ssh_panes_keep_the_host() {
+        assert_eq!(
+            decide(&facts(&["ssh", "macmini"], "/r", None), 30),
+            Decision::Label("SSH Mac Mini".into())
+        );
+
         for argv in [
             &["ssh", "user@mini.local"][..],
             &["env", "TERM=xterm", "ssh", "user@mini.local"],
@@ -756,7 +716,7 @@ mod tests {
         ] {
             assert_eq!(
                 decide(&facts(argv, "/r", None), 24),
-                Decision::Whole("ssh mini.local".into()),
+                Decision::Label("SSH mini.local".into()),
                 "{argv:?}"
             );
         }
