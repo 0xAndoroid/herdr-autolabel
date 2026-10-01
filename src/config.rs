@@ -12,6 +12,8 @@ pub struct Config {
     pub model: Option<String>,
     /// System prompt for the LLM; replaces the built-in text.
     pub prompt: Option<String>,
+    pub space_prompt: Option<String>,
+    pub debug: bool,
     pub max_chars: usize,
     pub lines: u32,
     pub llm_per_pane_secs: u64,
@@ -29,6 +31,8 @@ impl Default for Config {
             provider: "auto".into(),
             model: None,
             prompt: None,
+            space_prompt: None,
+            debug: false,
             max_chars: 25,
             lines: 40,
             llm_per_pane_secs: 15,
@@ -60,6 +64,8 @@ impl Config {
             provider,
             model,
             prompt,
+            space_prompt,
+            debug,
             max_chars,
             lines,
             llm_per_pane_secs,
@@ -182,8 +188,13 @@ mod tests {
 
     #[test]
     fn prompt_is_read() {
-        let c = Config::parse("prompt = \"\"\"name\nit\"\"\"\n").unwrap();
+        let c = Config::parse(
+            "prompt = \"\"\"name\nit\"\"\"\nspace_prompt = \"all panes\"\ndebug = true\n",
+        )
+        .unwrap();
         assert_eq!(c.prompt.as_deref(), Some("name\nit"));
+        assert_eq!(c.space_prompt.as_deref(), Some("all panes"));
+        assert!(c.debug);
     }
 
     #[test]

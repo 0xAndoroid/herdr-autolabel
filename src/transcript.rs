@@ -147,12 +147,14 @@ pub fn prompt_in<'a>(agent: &str, lines: impl Iterator<Item = &'a str>) -> Optio
         "pi" => ("\"role\":\"user\"", pi_prompt),
         _ => return None,
     };
-    lines.filter(|l| l.contains(marker)).find_map(|line| {
-        let text = prompt(line)?;
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        (!text.is_empty() && !is_acknowledgement(&text))
-            .then(|| text.chars().take(MAX_PROMPT_CHARS).collect())
-    })
+    lines
+        .filter(|l| l.contains(marker) || (agent == "codex" && l.contains("\"role\":\"user\"")))
+        .find_map(|line| {
+            let text = prompt(line)?;
+            let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            (!text.is_empty() && !is_acknowledgement(&text))
+                .then(|| text.chars().take(MAX_PROMPT_CHARS).collect())
+        })
 }
 
 const ACKNOWLEDGEMENTS: &[&str] = &[
@@ -211,14 +213,26 @@ struct CodexPayload {
     kind: String,
     #[serde(default)]
     message: String,
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    content: Value,
 }
 
-/// Codex: the `event_msg` record with a `user_message` payload holds the typed text alone; the
-/// `response_item` user messages also carry injected AGENTS.md and environment context.
+/// Codex writes either user_message events or user response items. Response items also
+/// contain injected AGENTS.md and environment blocks, excluded by typed_text.
 fn codex_prompt(line: &str) -> Option<String> {
     let entry: CodexLine = serde_json::from_str(line).ok()?;
-    (entry.kind == "event_msg" && entry.payload.kind == "user_message")
-        .then_some(entry.payload.message)
+    if entry.kind == "event_msg" && entry.payload.kind == "user_message" {
+        return Some(entry.payload.message);
+    }
+    if entry.kind == "response_item"
+        && entry.payload.kind == "message"
+        && entry.payload.role == "user"
+    {
+        return typed_text(&entry.payload.content);
+    }
+    None
 }
 
 #[derive(Deserialize)]
@@ -238,15 +252,19 @@ fn pi_prompt(line: &str) -> Option<String> {
 }
 
 /// The typed text of a message: a string, or the `text` blocks of a block list. Text opening
-/// with `<` is injected context, not typing.
+/// with `<` or the AGENTS.md instruction header is injected context, not typing.
 fn typed_text(content: &Value) -> Option<String> {
-    let typed = |s: &str| (!s.trim_start().starts_with('<')).then(|| s.to_string());
+    let typed = |s: &str| {
+        let start = s.trim_start();
+        (!start.starts_with('<') && !start.starts_with("# AGENTS.md instructions for "))
+            .then(|| s.to_string())
+    };
     match content {
         Value::String(s) => typed(s),
         Value::Array(blocks) => Some(
             blocks
                 .iter()
-                .filter(|b| b["type"] == "text")
+                .filter(|b| matches!(b["type"].as_str(), Some("text" | "input_text")))
                 .filter_map(|b| b["text"].as_str().and_then(typed))
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -329,6 +347,24 @@ mod tests {
             Some("continue to find another one.")
         );
         assert_eq!(last("codex", lines[1]), None);
+    }
+
+    #[test]
+    fn codex_user_items_supply_prompts_without_injected_context() {
+        let lines = [
+            r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /repo\nInjected rules"}]}}"##,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"configure task-only sidebar names"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ok, continue"}]}}"#,
+        ].join("\n");
+        assert_eq!(
+            last("codex", &lines).as_deref(),
+            Some("configure task-only sidebar names")
+        );
+        assert_eq!(
+            prompt_in("codex", lines.lines()).as_deref(),
+            Some("configure task-only sidebar names")
+        );
     }
 
     #[test]

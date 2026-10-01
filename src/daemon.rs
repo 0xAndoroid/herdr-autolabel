@@ -8,13 +8,15 @@ use serde_json::json;
 
 use crate::config::Config;
 use crate::fingerprint::{self, Fingerprint};
-use crate::herdr::{self, Client, PaneInfo, Snapshot};
+use crate::herdr::{self, Client, PaneInfo};
 use crate::heuristics::{self, Decision, PaneFacts, Proc};
 use crate::llm;
 use crate::logging::{log_debug, log_info, log_warn};
 use crate::ratelimit::RateLimiter;
-use crate::spaces::{self, PaneSummary, SpaceStates};
+use crate::spaces::{PaneSummary, SpaceStates};
 use crate::transcript;
+
+mod workspace;
 
 const MAX_CONNECT_FAILURES: u32 = 3;
 const CACHE_CAPACITY: usize = 256;
@@ -163,6 +165,7 @@ pub struct Daemon {
     prompts: transcript::Prompts,
     /// Space ownership + hysteresis, mirrored in `Paths::spaces_file`.
     spaces: SpaceStates,
+    space_fps: HashMap<String, u64>,
     cleared: HashSet<String>,
     started_at: String,
     pass_count: u64,
@@ -189,6 +192,7 @@ impl Daemon {
             labels: HashMap::new(),
             prompts: transcript::Prompts::default(),
             spaces: SpaceStates::new(),
+            space_fps: HashMap::new(),
             cleared: HashSet::new(),
             started_at: crate::logging::timestamp(),
             pass_count: 0,
@@ -274,6 +278,26 @@ impl Daemon {
             if SHUTDOWN.load(Ordering::Relaxed) {
                 break;
             }
+            let allowed =
+                self.config
+                    .permits(&[&pane.pane_id, &pane.workspace_id, pane.effective_cwd()]);
+            let pika = allowed && pane.agent.as_deref() == Some("pika");
+            let folder = if allowed && !pika {
+                heuristics::project(pane.effective_cwd()).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if pane
+                .tokens
+                .get(herdr::FOLDER_TOKEN)
+                .map_or("", String::as_str)
+                != folder
+                || (pika && pane.display_agent.as_deref() != Some("pika TUI"))
+                || (!pika && pane.display_agent.as_deref() == Some("pika TUI"))
+            {
+                self.client
+                    .set_pane_identity(&pane.pane_id, &folder, pika)?;
+            }
             let outcome = self.handle_pane(pane, force, &mut stats)?;
             outcomes.push(outcome);
         }
@@ -307,16 +331,35 @@ impl Daemon {
                 Source::SkippedTitle => pane.title.clone(),
                 _ => None,
             };
-            match shown.filter(|s| !s.trim().is_empty()) {
+            match shown.filter(|s| {
+                !s.trim().is_empty()
+                    && (source == Source::SkippedManual
+                        || !llm::postprocess(s, usize::MAX).is_empty())
+            }) {
                 Some(label) => {
+                    let project = heuristics::project(&cwd);
+                    let branch = crate::git::branch_for(Path::new(&cwd));
+                    let session = pane.agent_session.as_ref();
+                    let request = session.and_then(|s| self.prompts.last(s));
+                    let first = session.and_then(|s| self.prompts.first(s));
+                    let context = llm::user_message(&llm::Context {
+                        agent: pane.agent.as_deref(),
+                        agent_status: pane.agent_status.as_deref(),
+                        project: project.as_deref(),
+                        cwd_basename: &heuristics::directory_name(&cwd),
+                        branch: branch.as_deref(),
+                        topic: pane.terminal_title_stripped.as_deref(),
+                        request: request.as_deref(),
+                        first_request: first.as_deref(),
+                        ..llm::Context::default()
+                    });
                     self.labels.insert(
                         id.clone(),
                         PaneSummary {
                             label: label.trim().to_string(),
-                            agent: pane.agent.as_deref().is_some_and(|a| !a.is_empty()),
-                            busy: true,
-                            whole: source == Source::SkippedTitle,
-                            project: heuristics::project(&cwd),
+                            project,
+                            fingerprint: fingerprint::hash_str(&context),
+                            context,
                         },
                     );
                 }
@@ -381,7 +424,6 @@ impl Daemon {
             .agent
             .clone()
             .or_else(|| fg.as_ref().and_then(heuristics::agent_of));
-        let agent = agent_kind.is_some();
         // The summary a coding agent keeps in its terminal title — unless that is a status line
         // of the agent's own ("pika — idle").
         let title = agent_kind.as_deref().and_then(|kind| {
@@ -405,14 +447,35 @@ impl Daemon {
                     v
                 })
                 .unwrap_or_default(),
-            cwd: cwd.clone(),
-            branch: branch.clone(),
+            cwd: facts.cwd.clone(),
+            branch: facts.branch.clone(),
             agent: facts.agent.clone(),
             idle: agent_status == "idle",
             prompt: prompt.clone(),
             title: title.map(str::to_string),
         }
         .hash();
+
+        let fg_cmdline = fg.as_ref().map(|p| p.argv.join(" "));
+        let child_cmdline = child.as_ref().map(|p| p.argv.join(" "));
+        let cwd_base = heuristics::directory_name(&cwd);
+        let ctx = llm::Context {
+            agent: agent_kind.as_deref(),
+            agent_status: agent_kind.as_ref().map(|_| agent_status.as_str()),
+            process: fg_cmdline.as_deref(),
+            running: child_cmdline.as_deref(),
+            project: project.as_deref(),
+            cwd_basename: &cwd_base,
+            branch: branch.as_deref(),
+            request,
+            topic: title,
+            first_request: first_prompt.as_deref(),
+            lines: &[],
+        };
+        let summary = self.labels.entry(id.clone()).or_default();
+        summary.project.clone_from(&project);
+        summary.context = llm::user_message(&ctx);
+        summary.fingerprint = fp;
 
         if !force && self.last_fp.get(&id) == Some(&fp) {
             stats.unchanged += 1;
@@ -431,9 +494,8 @@ impl Daemon {
         }
 
         let decision = heuristics::decide(&facts, self.config.max_chars);
-        let whole = !matches!(decision, Decision::Label(_));
         let (label, source, record_fp) = match decision {
-            Decision::Label(l) | Decision::Whole(l) => (l, Source::Heuristic, true),
+            Decision::Label(l) => (l, Source::Heuristic, true),
             Decision::Llm { fallback } => {
                 if let Some(cached) = self.cache.get(fp) {
                     (cached, Source::Cache, true)
@@ -456,21 +518,9 @@ impl Daemon {
                         let lines: Vec<&str> = screen.lines().collect();
                         stats.llm_calls += 1;
                         self.total_llm_calls += 1;
-                        let fg_cmdline = fg.as_ref().map(|p| p.argv.join(" "));
-                        let child_cmdline = child.as_ref().map(|p| p.argv.join(" "));
-                        let cwd_base = heuristics::directory_name(&cwd);
                         let ctx = llm::Context {
-                            agent: facts.agent.as_deref(),
-                            agent_status: facts.agent.as_ref().map(|_| agent_status.as_str()),
-                            process: fg_cmdline.as_deref(),
-                            running: child_cmdline.as_deref(),
-                            project: project.as_deref(),
-                            cwd_basename: &cwd_base,
-                            branch: branch.as_deref(),
-                            request,
-                            topic: title,
-                            first_request: first_prompt.as_deref(),
                             lines: &lines,
+                            ..ctx
                         };
                         let t0 = Instant::now();
                         match provider.label(&ctx, self.config.max_chars) {
@@ -487,14 +537,27 @@ impl Daemon {
                                 stats.llm_errors += 1;
                                 self.last_error = Some(format!("llm: {e}"));
                                 log_warn!("{id}: llm failed ({e}); fallback {fallback:?}");
-                                (fallback, Source::Fallback, true)
+                                (
+                                    self.labels
+                                        .get(&id)
+                                        .map(|p| p.label.clone())
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or(fallback),
+                                    Source::Fallback,
+                                    false,
+                                )
                             }
                         }
                     } else {
                         log_debug!("{id}: llm rate-limited; keeping previous label");
                         // Keep the previous label (or the fallback when there is none) and don't
                         // record the fingerprint so the next pass retries.
-                        match self.labels.get(&id).map(|l| l.label.clone()) {
+                        match self
+                            .labels
+                            .get(&id)
+                            .map(|l| l.label.clone())
+                            .filter(|s| !s.is_empty())
+                        {
                             Some(previous) => (previous, Source::RateLimited, false),
                             None => (fallback, Source::Fallback, false),
                         }
@@ -509,20 +572,10 @@ impl Daemon {
             self.labels.remove(&id);
             return Ok(outcome(None, source, false));
         }
-        if source == Source::Fallback {
-            self.labels.remove(&id);
-        } else {
-            self.labels.insert(
-                id.clone(),
-                PaneSummary {
-                    label: label.clone(),
-                    agent,
-                    busy: fg.is_some(),
-                    whole,
-                    project,
-                },
-            );
+        if let Some(summary) = self.labels.get_mut(&id) {
+            summary.label.clone_from(&label);
         }
+        log_debug!("{id}: fingerprint={fp:016x} source={source:?} label={label:?}");
         if !self.config.label_panes {
             if record_fp {
                 self.last_fp.insert(id.clone(), fp);
@@ -543,194 +596,19 @@ impl Daemon {
         Ok(outcome(Some(label), source, false))
     }
 
-    fn handle_spaces(
-        &mut self,
-        snapshot: &Snapshot,
-        force: bool,
-        stats: &mut PassStats,
-    ) -> Result<Vec<SpaceOutcome>, herdr::Error> {
-        // The state file is shared with one-shot runs (`once`), which may have renamed spaces
-        // since our last pass: take the file as truth and keep only the in-memory hysteresis.
-        let mut states = spaces::load_states(&self.paths.spaces_file());
-        for (id, state) in &mut states {
-            state.pending = self.spaces.get(id).and_then(|s| s.pending.clone());
-        }
-        let alive: HashSet<&str> = snapshot
-            .workspaces
-            .iter()
-            .map(|w| w.workspace_id.as_str())
-            .collect();
-        let before = states.len();
-        states.retain(|id, _| alive.contains(id.as_str()));
-        let mut dirty = states.len() != before;
-        stats.spaces = snapshot.workspaces.len();
-        let mut outcomes = Vec::with_capacity(snapshot.workspaces.len());
-        let mut failed = None;
-
-        for ws in &snapshot.workspaces {
-            if SHUTDOWN.load(Ordering::Relaxed) {
-                break;
-            }
-            let id = &ws.workspace_id;
-            let outcome = |label: Option<String>, source: Source, applied: bool| SpaceOutcome {
-                workspace_id: id.clone(),
-                label,
-                source,
-                applied,
-            };
-            let panes: Vec<&PaneInfo> = snapshot
-                .panes
-                .iter()
-                .filter(|p| p.workspace_id == *id)
-                .collect();
-            let defaults = spaces::default_names(
-                panes
-                    .iter()
-                    .flat_map(|p| [p.cwd.as_deref().unwrap_or(""), p.effective_cwd()]),
-                ws.worktree.as_ref().map(|w| w.repo_name.as_str()),
-                ws.worktree.as_ref().map(|w| w.checkout_path.as_str()),
-            );
-            let ownership = spaces::classify(&ws.label, states.get(id), &defaults);
-            let state = states.entry(id.clone()).or_default();
-            match ownership {
-                spaces::Ownership::Manual => {
-                    if state.applied.take().is_some() {
-                        dirty = true;
-                        log_info!("{id}: space renamed by hand to {:?}; leaving it", ws.label);
-                    }
-                    state.pending = None;
-                    stats.spaces_skipped += 1;
-                    outcomes.push(outcome(
-                        Some(ws.label.clone()),
-                        Source::SkippedManual,
-                        false,
-                    ));
-                    continue;
-                }
-                spaces::Ownership::Default => {
-                    if state.applied.is_some() || state.original != ws.label {
-                        state.applied = None;
-                        state.original.clone_from(&ws.label);
-                        dirty = true;
-                    }
-                }
-                spaces::Ownership::Ours => {}
-            }
-            let summaries: Vec<PaneSummary> = panes
-                .iter()
-                .filter_map(|p| self.labels.get(&p.pane_id).cloned())
-                .collect();
-            let worktree = ws
-                .worktree
-                .as_ref()
-                .map(|w| heuristics::project_name(&w.repo_name));
-            let candidate = spaces::aggregate(&summaries, worktree, self.config.max_chars);
-            let Some(next) = state.observe(candidate.as_deref(), force) else {
-                let source = if state.pending.is_some() {
-                    Source::Pending
-                } else {
-                    Source::Unchanged
-                };
-                outcomes.push(outcome(state.applied.clone(), source, false));
-                continue;
-            };
-            if next == ws.label {
-                state.applied = Some(next.clone());
-                dirty = true;
-                outcomes.push(outcome(Some(next), Source::Aggregate, false));
-                continue;
-            }
-            // Pane labelling (and its LLM calls) ran after the snapshot; recheck the name.
-            let current = match self.client.workspace(id) {
-                Ok(w) => w,
-                Err(herdr::Error::Api { .. }) => continue, // closed meanwhile
-                Err(e) => {
-                    failed = Some(e);
-                    break;
-                }
-            };
-            if current.label != ws.label {
-                log_debug!("{id}: space renamed during the pass; skipping");
-                outcomes.push(outcome(None, Source::SkippedManual, false));
-                continue;
-            }
-            if let Err(e) = self.client.rename_workspace(id, &next) {
-                failed = Some(e);
-                break;
-            }
-            state.applied = Some(next.clone());
-            dirty = true;
-            stats.spaces_labeled += 1;
-            self.total_spaces_applied += 1;
-            log_debug!("{id}: space ← {next:?}");
-            outcomes.push(outcome(Some(next), Source::Aggregate, true));
-        }
-        if dirty && let Err(e) = spaces::save_states(&self.paths.spaces_file(), &states) {
-            log_warn!("spaces state write failed: {e}");
-        }
-        self.spaces = states;
-        failed.map_or(Ok(outcomes), Err)
-    }
-
-    /// Puts back the names spaces had before we renamed them; only spaces still carrying one
-    /// of our labels are touched.
-    pub fn restore_spaces(&mut self) {
-        let mut states = spaces::load_states(&self.paths.spaces_file());
-        if states.values().all(|s| s.applied.is_none()) {
-            return;
-        }
-        let snapshot = match self.client.snapshot() {
-            Ok(s) => s,
-            Err(e) => {
-                log_warn!("cannot restore space names: {e}");
-                return;
-            }
-        };
-        for ws in &snapshot.workspaces {
-            let Some(state) = states.get_mut(&ws.workspace_id) else {
-                continue;
-            };
-            if state.applied.as_deref() != Some(ws.label.as_str()) || state.original.is_empty() {
-                continue;
-            }
-            if state.original == ws.label {
-                state.applied = None;
-                continue;
-            }
-            match self
-                .client
-                .rename_workspace(&ws.workspace_id, &state.original)
-            {
-                Ok(()) => {
-                    log_debug!(
-                        "{}: space restored to {:?}",
-                        ws.workspace_id,
-                        state.original
-                    );
-                    state.applied = None;
-                }
-                Err(e) => log_warn!("{}: restore failed: {e}", ws.workspace_id),
-            }
-        }
-        if let Err(e) = spaces::save_states(&self.paths.spaces_file(), &states) {
-            log_warn!("spaces state write failed: {e}");
-        }
-        self.spaces = states;
-    }
-
     fn skip_pane(
         &mut self,
         pane: &PaneInfo,
         stats: &mut PassStats,
     ) -> Result<Option<Source>, herdr::Error> {
         let id = &pane.pane_id;
-        let source = if pane.has_manual_label() {
-            Some(Source::SkippedManual)
-        } else if !self
+        let source = if !self
             .config
             .permits(&[id, &pane.workspace_id, pane.effective_cwd()])
         {
             Some(Source::SkippedFilter)
+        } else if pane.has_manual_label() {
+            Some(Source::SkippedManual)
         } else if pane
             .title
             .as_ref()
@@ -794,6 +672,7 @@ impl Daemon {
             "socket": self.paths.socket,
             "provider": self.provider.as_ref().map(|p| p.kind.name()),
             "model": self.provider.as_ref().map(|p| p.model.clone()),
+            "debug": crate::logging::debug_enabled(),
             "started_at": self.started_at,
             "updated_at": crate::logging::timestamp(),
             "pass_count": self.pass_count,
@@ -829,584 +708,4 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
-    #![expect(clippy::unwrap_used)]
-
-    use super::*;
-
-    fn finish(
-        daemon: &Daemon,
-        server: std::thread::JoinHandle<Vec<serde_json::Value>>,
-    ) -> Vec<serde_json::Value> {
-        let seen = server.join().unwrap();
-        let _ = std::fs::remove_dir_all(&daemon.paths.state_dir);
-        seen
-    }
-
-    fn mock_daemon(
-        name: &str,
-        replies: Vec<(&'static str, serde_json::Value)>,
-    ) -> (Daemon, std::thread::JoinHandle<Vec<serde_json::Value>>) {
-        mock_daemon_with(name, Config::default(), replies)
-    }
-
-    fn mock_daemon_with(
-        name: &str,
-        config: Config,
-        replies: Vec<(&'static str, serde_json::Value)>,
-    ) -> (Daemon, std::thread::JoinHandle<Vec<serde_json::Value>>) {
-        use std::io::{BufRead, BufReader, Write};
-        use std::os::unix::net::UnixListener;
-        // Unique per invocation so concurrent tests never share sockets or budget files.
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("hal-{name}-{}-{nonce}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("s.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let paths = Paths {
-            socket: socket.clone(),
-            state_dir: dir.clone(),
-            config_dir: dir.clone(),
-        };
-        let server = std::thread::spawn(move || {
-            let mut seen = Vec::new();
-            for (method, response) in replies {
-                let (mut stream, _) = listener.accept().unwrap();
-                let mut line = String::new();
-                BufReader::new(stream.try_clone().unwrap())
-                    .read_line(&mut line)
-                    .unwrap();
-                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(request["method"], method, "request {}", seen.len());
-                if method == "pane.report_metadata" {
-                    assert_eq!(request["params"]["source"], herdr::SOURCE);
-                }
-                let mut response = response;
-                response["id"] = request["id"].clone();
-                writeln!(stream, "{response}").unwrap();
-                seen.push(request);
-            }
-            seen
-        });
-        (Daemon::new(paths, config, None), server)
-    }
-
-    #[test]
-    fn manual_and_competing_titles_clear_once_and_relabel_when_title_vanishes() {
-        for manual in [false, true] {
-            let mut replies = vec![("pane.report_metadata", json!({"result": {"type": "ok"}}))];
-            if !manual {
-                replies.extend([
-                    ("pane.process_info", json!({"result": {"process_info": {}}})),
-                    ("pane.get", json!({"result": {"pane": {"pane_id": "p1"}}})),
-                    ("pane.report_metadata", json!({"result": {"type": "ok"}})),
-                ]);
-            }
-            let (mut daemon, server) =
-                mock_daemon(if manual { "manual" } else { "competing" }, replies);
-            let mut pane = PaneInfo {
-                pane_id: "p1".into(),
-                title: Some("other title".into()),
-                ..Default::default()
-            };
-            if manual {
-                pane.label = Some("mine".into());
-            }
-            daemon.applied.insert("p1".into(), "ours".into());
-            let mut stats = PassStats::default();
-            assert!(
-                !daemon
-                    .handle_pane(&pane, false, &mut stats)
-                    .unwrap()
-                    .applied
-            );
-            assert!(!daemon.handle_pane(&pane, true, &mut stats).unwrap().applied);
-            assert!(daemon.applied.is_empty());
-            if !manual {
-                pane.title = None;
-                let outcome = daemon.handle_pane(&pane, true, &mut stats).unwrap();
-                assert_ne!(outcome.source, Source::SkippedTitle);
-                assert!(outcome.applied);
-                assert!(daemon.applied.contains_key("p1"));
-            }
-            finish(&daemon, server);
-        }
-    }
-
-    #[test]
-    fn failed_clear_is_retried_until_acknowledged() {
-        let (mut daemon, server) = mock_daemon(
-            "clear-retry",
-            vec![
-                (
-                    "pane.report_metadata",
-                    json!({"error": {"code": "busy", "message": "retry"}}),
-                ),
-                ("pane.report_metadata", json!({"result": {"type": "ok"}})),
-            ],
-        );
-        let pane = PaneInfo {
-            pane_id: "p1".into(),
-            label: Some("mine".into()),
-            title: Some("ours".into()),
-            ..Default::default()
-        };
-        let mut stats = PassStats::default();
-        assert!(daemon.handle_pane(&pane, false, &mut stats).is_err());
-        assert!(daemon.handle_pane(&pane, false, &mut stats).is_ok());
-        assert!(daemon.handle_pane(&pane, false, &mut stats).is_ok());
-        finish(&daemon, server);
-    }
-
-    #[test]
-    fn failed_apply_does_not_cache_fingerprint() {
-        let mut replies = Vec::new();
-        for fail in [true, false] {
-            replies.extend([
-                ("pane.process_info", json!({"result": {"process_info": {}}})),
-                ("pane.get", json!({"result": {"pane": {"pane_id": "p1"}}})),
-                (
-                    "pane.report_metadata",
-                    if fail {
-                        json!({"error": {"code": "busy"}})
-                    } else {
-                        json!({"result": {"type": "ok"}})
-                    },
-                ),
-            ]);
-        }
-        let (mut daemon, server) = mock_daemon("apply-retry", replies);
-        let pane = PaneInfo {
-            pane_id: "p1".into(),
-            ..Default::default()
-        };
-        let mut stats = PassStats::default();
-        assert!(daemon.handle_pane(&pane, false, &mut stats).is_err());
-        assert!(daemon.last_fp.is_empty());
-        assert!(
-            daemon
-                .handle_pane(&pane, false, &mut stats)
-                .unwrap()
-                .applied
-        );
-        finish(&daemon, server);
-    }
-
-    #[test]
-    fn rename_during_labeling_prevents_write() {
-        let (mut daemon, server) = mock_daemon(
-            "rename",
-            vec![
-                ("pane.process_info", json!({"result": {"process_info": {}}})),
-                (
-                    "pane.get",
-                    json!({"result": {"pane": {"pane_id": "p1", "label": "mine"}}}),
-                ),
-            ],
-        );
-        let pane = PaneInfo {
-            pane_id: "p1".into(),
-            ..Default::default()
-        };
-        assert!(
-            !daemon
-                .handle_pane(&pane, false, &mut PassStats::default())
-                .unwrap()
-                .applied
-        );
-        assert!(daemon.last_fp.is_empty());
-        finish(&daemon, server);
-    }
-
-    #[test]
-    fn matching_context_reuses_label_even_when_different_contexts_name_it_the_same() {
-        let mut replies = labelled_pane("p1");
-        replies.extend((0..4).flat_map(|_| unchanged_pane()));
-        let (mut daemon, server) = mock_daemon("context-cache", replies);
-        let label = "herdr: fix labels";
-        for title in ["Task A", "Task B"] {
-            let fp = Fingerprint {
-                agent: Some("claude".into()),
-                title: Some(title.into()),
-                ..Default::default()
-            }
-            .hash();
-            daemon.cache.insert(fp, label.into());
-        }
-        let mut pane = PaneInfo {
-            pane_id: "p1".into(),
-            agent: Some("claude".into()),
-            ..Default::default()
-        };
-        let mut stats = PassStats::default();
-        for (title, source) in [
-            ("Task A", Source::Cache),
-            ("Task A", Source::Unchanged),
-            ("Task B", Source::Cache),
-            ("Task B", Source::Unchanged),
-            ("Task A", Source::Cache),
-        ] {
-            pane.terminal_title_stripped = Some(title.into());
-            let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
-            assert_eq!(outcome.source, source);
-            assert_eq!(outcome.label.as_deref(), Some(label));
-            pane.title = outcome.label;
-        }
-        assert_eq!(stats.labeled, 1);
-        assert_eq!(stats.llm_calls, 0);
-        finish(&daemon, server);
-    }
-
-    fn ws(id: &str, label: &str, focused: bool) -> serde_json::Value {
-        json!({"workspace_id": id, "label": label, "focused": focused, "pane_count": 1})
-    }
-
-    fn pane_json(
-        id: &str,
-        ws: &str,
-        cwd: &str,
-        focused: bool,
-        title: Option<&str>,
-    ) -> serde_json::Value {
-        json!({"pane_id": id, "workspace_id": ws, "cwd": cwd, "focused": focused, "title": title})
-    }
-
-    fn snapshot(
-        panes: Vec<serde_json::Value>,
-        workspaces: Vec<serde_json::Value>,
-    ) -> serde_json::Value {
-        json!({"result": {"snapshot": {"panes": panes, "workspaces": workspaces}}})
-    }
-
-    fn labelled_pane(id: &str) -> Vec<(&'static str, serde_json::Value)> {
-        vec![
-            ("pane.process_info", json!({"result": {"process_info": {}}})),
-            ("pane.get", json!({"result": {"pane": {"pane_id": id}}})),
-            ("pane.report_metadata", json!({"result": {"type": "ok"}})),
-        ]
-    }
-
-    fn unchanged_pane() -> Vec<(&'static str, serde_json::Value)> {
-        vec![("pane.process_info", json!({"result": {"process_info": {}}}))]
-    }
-
-    #[test]
-    fn spaces_follow_their_panes_with_hysteresis_and_restore_on_stop() {
-        let root = std::env::temp_dir().join(format!("hal-spaces-repos-{}", std::process::id()));
-        for d in [
-            "pika/.git",
-            "pika/crates",
-            "pika/src",
-            "jolt/.git",
-            "jolt/sub",
-        ] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-        let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
-        let mut replies = vec![(
-            "session.snapshot",
-            snapshot(
-                vec![
-                    pane_json("w1:p1", "w1", &p("pika/crates"), false, None),
-                    pane_json("w2:p1", "w2", &p("jolt"), true, None),
-                    pane_json("w2:p2", "w2", &p("jolt/sub"), false, None),
-                ],
-                vec![ws("w1", "pika", false), ws("w2", "jolt", true)],
-            ),
-        )];
-        replies.extend(labelled_pane("w1:p1"));
-        replies.extend(labelled_pane("w2:p1"));
-        replies.extend(labelled_pane("w2:p2"));
-        replies.extend([
-            (
-                "workspace.get",
-                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
-            ),
-            ("workspace.rename", json!({"result": {"type": "ok"}})),
-        ]);
-        let pass2_panes = vec![
-            pane_json("w1:p1", "w1", &p("pika/src"), false, Some("crates")),
-            pane_json("w2:p1", "w2", &p("jolt"), true, Some("jolt")),
-            pane_json("w2:p2", "w2", &p("jolt/sub"), false, Some("sub")),
-        ];
-        let pass2_ws = vec![ws("w1", "pika: crates", false), ws("w2", "jolt", true)];
-        replies.push(("session.snapshot", snapshot(pass2_panes, pass2_ws.clone())));
-        replies.extend(labelled_pane("w1:p1"));
-        replies.extend(unchanged_pane());
-        replies.extend(unchanged_pane());
-        let pass3_panes = vec![
-            pane_json("w1:p1", "w1", &p("pika/src"), false, Some("src")),
-            pane_json("w2:p1", "w2", &p("jolt"), true, Some("jolt")),
-            pane_json("w2:p2", "w2", &p("jolt/sub"), false, Some("sub")),
-        ];
-        replies.push(("session.snapshot", snapshot(pass3_panes.clone(), pass2_ws)));
-        for _ in 0..3 {
-            replies.extend(unchanged_pane());
-        }
-        replies.extend([
-            (
-                "workspace.get",
-                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika: crates"}}}),
-            ),
-            ("workspace.rename", json!({"result": {"type": "ok"}})),
-        ]);
-        replies.push((
-            "session.snapshot",
-            snapshot(
-                pass3_panes,
-                vec![ws("w1", "pika: src", false), ws("w2", "jolt", true)],
-            ),
-        ));
-        replies.push(("workspace.rename", json!({"result": {"type": "ok"}})));
-
-        let (mut daemon, server) = mock_daemon("spaces", replies);
-        let (stats, panes, spaces) = daemon.pass(false).unwrap();
-        assert_eq!(stats.spaces, 2);
-        assert_eq!(stats.spaces_labeled, 1);
-        assert_eq!(panes.iter().filter(|o| o.applied).count(), 3);
-        let by_id = |v: &[SpaceOutcome], id: &str| {
-            v.iter().find(|o| o.workspace_id == id).cloned().unwrap()
-        };
-        assert_eq!(by_id(&spaces, "w1").label.as_deref(), Some("pika: crates"));
-        assert!(by_id(&spaces, "w1").applied);
-        assert_eq!(by_id(&spaces, "w2").label.as_deref(), Some("jolt"));
-        assert!(!by_id(&spaces, "w2").applied);
-        let states = spaces::load_states(&daemon.paths.spaces_file());
-        assert_eq!(states["w1"].original, "pika");
-        assert_eq!(states["w1"].applied.as_deref(), Some("pika: crates"));
-        assert_eq!(states["w2"].applied.as_deref(), Some("jolt"));
-
-        let (stats, _, spaces) = daemon.pass(false).unwrap();
-        assert_eq!(stats.spaces_labeled, 0);
-        assert_eq!(by_id(&spaces, "w1").source, Source::Pending);
-        assert_eq!(by_id(&spaces, "w1").label.as_deref(), Some("pika: crates"));
-
-        let (stats, _, spaces) = daemon.pass(false).unwrap();
-        assert_eq!(stats.spaces_labeled, 1);
-        assert_eq!(by_id(&spaces, "w1").label.as_deref(), Some("pika: src"));
-        assert!(by_id(&spaces, "w1").applied);
-
-        daemon.restore_spaces();
-        let states = spaces::load_states(&daemon.paths.spaces_file());
-        assert_eq!(states["w1"].applied, None);
-        assert_eq!(states["w2"].applied, None);
-
-        let seen = finish(&daemon, server);
-        let renames: Vec<(String, String)> = seen
-            .iter()
-            .filter(|r| r["method"] == "workspace.rename")
-            .map(|r| {
-                (
-                    r["params"]["workspace_id"].as_str().unwrap().to_string(),
-                    r["params"]["label"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
-        assert_eq!(
-            renames,
-            vec![
-                ("w1".to_string(), "pika: crates".to_string()),
-                ("w1".to_string(), "pika: src".to_string()),
-                ("w1".to_string(), "pika".to_string()),
-            ]
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn hand_named_spaces_are_never_renamed() {
-        let mut replies = vec![(
-            "session.snapshot",
-            snapshot(
-                vec![
-                    pane_json("w1:p1", "w1", "/x/pika", true, None),
-                    pane_json("w2:p1", "w2", "/x/jolt", false, None),
-                ],
-                vec![ws("w1", "my project", true), ws("w2", "handpicked", false)],
-            ),
-        )];
-        replies.extend(labelled_pane("w1:p1"));
-        replies.extend(labelled_pane("w2:p1"));
-        let (mut daemon, server) = mock_daemon("manual-spaces", replies);
-        let mut states = spaces::SpaceStates::new();
-        states.insert(
-            "w1".into(),
-            spaces::SpaceState {
-                original: "pika".into(),
-                applied: None,
-                pending: None,
-            },
-        );
-        states.insert(
-            "w2".into(),
-            spaces::SpaceState {
-                original: "jolt".into(),
-                applied: Some("cargo build".into()),
-                pending: None,
-            },
-        );
-        spaces::save_states(&daemon.paths.spaces_file(), &states).unwrap();
-        let (stats, _, spaces) = daemon.pass(false).unwrap();
-        assert_eq!(stats.spaces_skipped, 2);
-        assert_eq!(stats.spaces_labeled, 0);
-        assert!(
-            spaces
-                .iter()
-                .all(|o| o.source == Source::SkippedManual && !o.applied)
-        );
-        let states = spaces::load_states(&daemon.paths.spaces_file());
-        assert_eq!(
-            states["w2"].applied, None,
-            "released after the user's rename"
-        );
-        daemon.restore_spaces();
-        assert!(
-            finish(&daemon, server)
-                .iter()
-                .all(|r| r["method"] != "workspace.rename")
-        );
-    }
-
-    #[test]
-    fn panes_off_still_feed_spaces() {
-        let root = std::env::temp_dir().join(format!("hal-panes-off-{}", std::process::id()));
-        std::fs::create_dir_all(root.join("pika/.git")).unwrap();
-        std::fs::create_dir_all(root.join("pika/crates")).unwrap();
-        let cwd = root.join("pika/crates").to_string_lossy().into_owned();
-        let mut replies = vec![(
-            "session.snapshot",
-            snapshot(
-                vec![pane_json("w1:p1", "w1", &cwd, true, None)],
-                vec![ws("w1", "pika", true)],
-            ),
-        )];
-        replies.extend(unchanged_pane());
-        replies.extend([
-            (
-                "workspace.get",
-                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
-            ),
-            ("workspace.rename", json!({"result": {"type": "ok"}})),
-        ]);
-        let config = Config::parse("label_panes = false\n").unwrap();
-        let (mut daemon, server) = mock_daemon_with("panes-off", config, replies);
-        let (stats, panes, spaces) = daemon.pass(false).unwrap();
-        assert_eq!(stats.labeled, 0);
-        assert_eq!(panes[0].label.as_deref(), Some("crates"));
-        assert!(!panes[0].applied);
-        assert!(daemon.applied.is_empty());
-        assert_eq!(spaces[0].label.as_deref(), Some("pika: crates"));
-        assert!(spaces[0].applied);
-        let seen = finish(&daemon, server);
-        assert!(seen.iter().all(|r| r["method"] != "pane.report_metadata"));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn failed_space_rename_keeps_earlier_renames_in_state() {
-        let root = std::env::temp_dir().join(format!("hal-rename-fail-{}", std::process::id()));
-        for d in ["pika/.git", "pika/crates", "jolt/.git", "jolt/sub"] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-        let p = |rel: &str| root.join(rel).to_string_lossy().into_owned();
-        let mut replies = vec![(
-            "session.snapshot",
-            snapshot(
-                vec![
-                    pane_json("w1:p1", "w1", &p("pika/crates"), true, None),
-                    pane_json("w2:p1", "w2", &p("jolt/sub"), false, None),
-                ],
-                vec![ws("w1", "pika", true), ws("w2", "jolt", false)],
-            ),
-        )];
-        replies.extend(unchanged_pane());
-        replies.extend(unchanged_pane());
-        replies.extend([
-            (
-                "workspace.get",
-                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
-            ),
-            ("workspace.rename", json!({"result": {"type": "ok"}})),
-            (
-                "workspace.get",
-                json!({"result": {"workspace": {"workspace_id": "w2", "label": "jolt"}}}),
-            ),
-            (
-                "workspace.rename",
-                json!({"error": {"code": "busy", "message": "retry"}}),
-            ),
-        ]);
-        let config = Config::parse("label_panes = false\n").unwrap();
-        let (mut daemon, server) = mock_daemon_with("rename-fail", config, replies);
-        assert!(daemon.pass(false).is_err());
-        let states = spaces::load_states(&daemon.paths.spaces_file());
-        assert_eq!(states["w1"].original, "pika");
-        assert_eq!(states["w1"].applied.as_deref(), Some("pika: crates"));
-        finish(&daemon, server);
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn manual_pane_labels_count_for_their_space() {
-        let replies = vec![
-            (
-                "session.snapshot",
-                snapshot(
-                    vec![
-                        json!({"pane_id": "w1:p1", "workspace_id": "w1", "cwd": "/x/pika",
-                        "focused": true, "label": "billing rewrite"}),
-                    ],
-                    vec![ws("w1", "pika", true)],
-                ),
-            ),
-            (
-                "workspace.get",
-                json!({"result": {"workspace": {"workspace_id": "w1", "label": "pika"}}}),
-            ),
-            ("workspace.rename", json!({"result": {"type": "ok"}})),
-        ];
-        let (mut daemon, server) = mock_daemon("manual-pane", replies);
-        let (stats, panes, spaces) = daemon.pass(false).unwrap();
-        assert_eq!(panes[0].source, Source::SkippedManual);
-        assert_eq!(stats.spaces_labeled, 1);
-        assert_eq!(spaces[0].label.as_deref(), Some("pika: billing rewrite"));
-        let seen = finish(&daemon, server);
-        assert_eq!(
-            seen.last().unwrap()["params"]["label"],
-            "pika: billing rewrite"
-        );
-    }
-
-    #[test]
-    fn cache_is_lru_bounded() {
-        let mut c = LabelCache::new();
-        for i in 0..(CACHE_CAPACITY as u64 + 10) {
-            c.insert(i, format!("l{i}"));
-        }
-        assert_eq!(c.map.len(), CACHE_CAPACITY);
-        assert_eq!(c.get(0), None);
-        assert_eq!(c.get(CACHE_CAPACITY as u64 + 9).as_deref(), Some("l265"));
-        assert!(c.get(10).is_some());
-        c.insert(9999, "x".into());
-        assert!(c.get(10).is_some());
-        assert_eq!(c.get(11), None);
-    }
-
-    #[test]
-    fn pidfile_is_keyed_by_socket() {
-        let a = Paths {
-            socket: "/a.sock".into(),
-            state_dir: "/s".into(),
-            config_dir: "/c".into(),
-        };
-        let b = Paths {
-            socket: "/b.sock".into(),
-            ..a.clone()
-        };
-        assert_ne!(a.pidfile(), b.pidfile());
-        assert!(a.pidfile().starts_with("/s"));
-    }
-}
+mod tests;

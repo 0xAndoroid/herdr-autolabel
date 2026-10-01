@@ -5,7 +5,7 @@ min_herdr_version = "0.9.0"
 platforms = ["macos", "linux"]
 
 [[build]]
-command = ["cargo", "build", "--release"]
+command = ["cargo", "build", "-q", "--message-format=short", "--release"]
 
 # Runs once per server start (after session restore, socket ready). Spawns the
 # detached daemon and exits immediately.

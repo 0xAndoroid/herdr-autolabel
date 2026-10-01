@@ -18,12 +18,18 @@ pub fn branch_for(cwd: &Path) -> Option<String> {
     None
 }
 
-/// Basename of the repository checkout containing `cwd` (the directory holding `.git`).
+/// Repository name, following a linked worktree's `commondir` to the main checkout.
 pub fn repo_basename(cwd: &Path) -> Option<String> {
     let mut dir = Some(cwd);
     for _ in 0..=MAX_PARENT_WALK {
         let d = dir?;
-        if git_dir_at(d).is_some() {
+        if let Some(git_dir) = git_dir_at(d) {
+            if let Ok(common) = std::fs::read_to_string(git_dir.join("commondir"))
+                && let Ok(common) = git_dir.join(common.trim()).canonicalize()
+                && let Some(root) = common.parent()
+            {
+                return root.file_name().map(|n| n.to_string_lossy().into_owned());
+            }
             return d.file_name().map(|n| n.to_string_lossy().into_owned());
         }
         dir = d.parent();
@@ -115,10 +121,12 @@ mod tests {
         let common = root.join("main/.git/worktrees/wt1");
         std::fs::create_dir_all(&common).unwrap();
         std::fs::write(common.join("HEAD"), "ref: refs/heads/wt-branch\n").unwrap();
+        std::fs::write(common.join("commondir"), "../..\n").unwrap();
         let wt = root.join("wt1");
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", common.display())).unwrap();
         assert_eq!(branch_for(&wt).as_deref(), Some("wt-branch"));
+        assert_eq!(repo_basename(&wt).as_deref(), Some("main"));
         std::fs::write(wt.join(".git"), "gitdir: ../main/.git/worktrees/wt1\n").unwrap();
         assert_eq!(branch_for(&wt).as_deref(), Some("wt-branch"));
         let _ = std::fs::remove_dir_all(&root);
