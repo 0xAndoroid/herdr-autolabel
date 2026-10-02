@@ -8,9 +8,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+/// A failed or rejected call holds its target off this long, instead of `per_pane_min`.
+const FAILURE_BACKOFF_MS: u64 = 15_000;
+
 #[derive(Default, Deserialize, Serialize)]
+#[serde(default)]
 struct Budget {
-    last_call: HashMap<String, u64>,
+    /// Earliest time each pane or workspace may call again.
+    next_call: HashMap<String, u64>,
     calls: VecDeque<u64>,
 }
 
@@ -29,7 +34,11 @@ impl RateLimiter {
         }
     }
 
-    fn acquire_at(&self, pane: &str, now: u64) -> Result<bool, Box<dyn std::error::Error>> {
+    fn update(
+        &self,
+        now: u64,
+        update: impl FnOnce(&mut Budget) -> bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -48,9 +57,7 @@ impl RateLimiter {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Budget::default(),
             Err(e) => return Err(e.into()),
         };
-        budget
-            .last_call
-            .retain(|_, last| now.saturating_sub(*last) < 86_400_000);
+        budget.next_call.retain(|_, next| *next > now);
         while budget
             .calls
             .front()
@@ -58,24 +65,37 @@ impl RateLimiter {
         {
             budget.calls.pop_front();
         }
-        if budget.last_call.get(pane).is_some_and(|last| {
-            u128::from(now.saturating_sub(*last)) < self.per_pane_min.as_millis()
-        }) || budget.calls.len() >= self.capacity
-        {
+        if !update(&mut budget) {
             return Ok(false);
         }
-        budget.last_call.insert(pane.to_string(), now);
-        budget.calls.push_back(now);
         crate::daemon::write_atomic(&self.path, &serde_json::to_vec(&budget)?)?;
         Ok(true)
     }
 
+    fn acquire_at(&self, pane: &str, now: u64) -> Result<bool, Box<dyn std::error::Error>> {
+        self.update(now, |budget| {
+            if budget.next_call.contains_key(pane) || budget.calls.len() >= self.capacity {
+                return false;
+            }
+            budget
+                .next_call
+                .insert(pane.to_string(), now + self.per_pane_min.as_millis() as u64);
+            budget.calls.push_back(now);
+            true
+        })
+    }
+
+    fn back_off_at(&self, pane: &str, now: u64) -> Result<bool, Box<dyn std::error::Error>> {
+        self.update(now, |budget| {
+            budget
+                .next_call
+                .insert(pane.to_string(), now + FAILURE_BACKOFF_MS);
+            true
+        })
+    }
+
     pub fn try_acquire(&self, pane: &str) -> bool {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        match self.acquire_at(pane, now) {
+        match self.acquire_at(pane, now_ms()) {
             Ok(allowed) => allowed,
             Err(e) => {
                 crate::logging::log_warn!("LLM budget unavailable ({e}); skipping call");
@@ -83,6 +103,20 @@ impl RateLimiter {
             }
         }
     }
+
+    /// Call after a failed or rejected request.
+    pub fn back_off(&self, pane: &str) {
+        if let Err(e) = self.back_off_at(pane, now_ms()) {
+            crate::logging::log_warn!("LLM budget unavailable ({e}); backoff not recorded");
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 #[cfg(test)]
@@ -122,6 +156,19 @@ mod tests {
         assert!(rl.acquire_at("p1", 0).unwrap());
         assert!(!rl.acquire_at("p1", 2_999).unwrap());
         assert!(rl.acquire_at("p1", 3_000).unwrap());
+        clean(&rl);
+    }
+
+    #[test]
+    fn failed_call_backs_off_its_pane_for_fifteen_seconds() {
+        let path = std::env::temp_dir().join(format!("hal-budget-bo-{}.json", std::process::id()));
+        let rl = RateLimiter::new(Duration::from_secs(3), 6, path);
+        assert!(rl.acquire_at("p1", 0).unwrap());
+        rl.back_off_at("p1", 1_000).unwrap();
+        assert!(!rl.acquire_at("p1", 4_000).unwrap());
+        assert!(rl.acquire_at("p2", 4_000).unwrap());
+        assert!(!rl.acquire_at("p1", 15_999).unwrap());
+        assert!(rl.acquire_at("p1", 16_000).unwrap());
         clean(&rl);
     }
 

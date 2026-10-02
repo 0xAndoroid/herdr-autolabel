@@ -48,6 +48,8 @@ pub enum Decision {
     Label(String),
     /// Ask the LLM; use `fallback` when it fails or is unavailable.
     Llm { fallback: String },
+    /// A coding agent with no request yet; the daemon keeps an earlier task label instead.
+    NewSession(String),
 }
 
 const NAMED_AGENTS: &[&str] = &["pika"];
@@ -473,7 +475,7 @@ pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
             && facts.agent_status != "working"
             && TRANSCRIPT_AGENTS.contains(&agent.as_str())
         {
-            return Decision::Label(fin("New session"));
+            return Decision::NewSession(fin("New session"));
         }
         let fallback = fin(if facts.agent_status == "working" {
             "working"
@@ -520,9 +522,7 @@ mod tests {
     fn label_of(argv: &[&str], cwd: &str, branch: Option<&str>) -> String {
         match decide(&facts(argv, cwd, branch), 24) {
             Decision::Label(l) => l,
-            Decision::Llm { fallback } => {
-                panic!("expected heuristic label, got LLM (fallback {fallback})")
-            }
+            other => panic!("expected heuristic label, got {other:?}"),
         }
     }
 
@@ -720,11 +720,11 @@ mod tests {
         let mut f = facts(&["claude"], "/x", None);
         f.has_request = false;
         f.agent_status = "idle".into();
-        assert_eq!(decide(&f, 24), Decision::Label("New session".into()));
+        assert_eq!(decide(&f, 24), Decision::NewSession("New session".into()));
         f.agent_status = "working".into();
         assert!(matches!(decide(&f, 24), Decision::Llm { .. }));
         f.agent_status = "unknown".into();
-        assert_eq!(decide(&f, 24), Decision::Label("New session".into()));
+        assert_eq!(decide(&f, 24), Decision::NewSession("New session".into()));
         f.has_request = true;
         assert!(matches!(decide(&f, 24), Decision::Llm { .. }));
         let mut f = facts(&["gemini"], "/x", None);

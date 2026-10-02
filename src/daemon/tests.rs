@@ -336,6 +336,51 @@ fn new_session_until_first_prompt_then_one_model_label_per_prompt() {
     assert!(seen.iter().all(|r| r["method"] != "pane.read"));
 }
 
+#[test]
+fn new_session_leaves_on_work_and_never_replaces_a_task_label() {
+    let mut replies: Vec<_> = (0..3).flat_map(|_| labelled_pane("p1")).collect();
+    replies.extend((0..2).flat_map(|_| unchanged_pane()));
+    let (mut daemon, server) = mock_daemon("new-session-task", replies);
+    let fp = Fingerprint {
+        agent: Some("claude".into()),
+        working: true,
+        title: Some("Fix parser".into()),
+        ..Default::default()
+    }
+    .hash();
+    daemon.cache.insert(fp, "Fix parser".into());
+    let mut pane = PaneInfo {
+        pane_id: "p1".into(),
+        agent: Some("claude".into()),
+        ..Default::default()
+    };
+    let mut stats = PassStats::default();
+    for (status, title, source, label) in [
+        (None, None, Source::Heuristic, "New session"),
+        (Some("working"), None, Source::Fallback, "working"),
+        (
+            Some("working"),
+            Some("Fix parser"),
+            Source::Cache,
+            "Fix parser",
+        ),
+        (Some("idle"), None, Source::Unchanged, "Fix parser"),
+        (Some("idle"), None, Source::Unchanged, "Fix parser"),
+    ] {
+        pane.agent_status = status.map(String::from);
+        pane.terminal_title_stripped = title.map(String::from);
+        let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
+        assert_eq!(
+            (outcome.source, outcome.label.as_deref()),
+            (source, Some(label))
+        );
+        pane.title = outcome.label;
+    }
+    assert_eq!(stats.llm_calls, 0);
+    let seen = finish(&daemon, server);
+    assert!(seen.iter().all(|r| r["method"] != "pane.read"));
+}
+
 fn ws(id: &str, label: &str, focused: bool) -> serde_json::Value {
     json!({"workspace_id": id, "label": label, "focused": focused, "pane_count": 1, "tokens": {herdr::FOLDER_TOKEN: if id == "w1" { "pika" } else { "jolt" }}})
 }

@@ -167,6 +167,8 @@ pub struct Daemon {
     spaces: SpaceStates,
     space_fps: HashMap<String, u64>,
     cleared: HashSet<String>,
+    /// Panes whose current agent has had a task label from the model or the cache.
+    tasked: HashSet<String>,
     started_at: String,
     pass_count: u64,
     total_llm_calls: u64,
@@ -194,6 +196,7 @@ impl Daemon {
             spaces: SpaceStates::new(),
             space_fps: HashMap::new(),
             cleared: HashSet::new(),
+            tasked: HashSet::new(),
             started_at: crate::logging::timestamp(),
             pass_count: 0,
             total_llm_calls: 0,
@@ -273,6 +276,7 @@ impl Daemon {
         self.applied.retain(|k, _| alive.contains(k));
         self.labels.retain(|k, _| alive.contains(k));
         self.cleared.retain(|k| alive.contains(k));
+        self.tasked.retain(|k| alive.contains(k));
 
         for pane in &snapshot.panes {
             if SHUTDOWN.load(Ordering::Relaxed) {
@@ -452,6 +456,7 @@ impl Daemon {
             branch: facts.branch.clone(),
             agent: facts.agent.clone(),
             idle: agent_status == "idle",
+            working: agent_status == "working",
             prompt: prompt.clone(),
             title: title.map(str::to_string),
         }
@@ -496,15 +501,22 @@ impl Daemon {
 
         let decision = heuristics::decide(&facts, self.config.max_chars);
         let (label, source, record_fp) = match decision {
-            Decision::Label(l) => (l, Source::Heuristic, true),
+            Decision::Label(l) => {
+                self.tasked.remove(&id);
+                (l, Source::Heuristic, true)
+            }
+            Decision::NewSession(l) => {
+                match self.labels.get(&id).filter(|_| self.tasked.contains(&id)) {
+                    Some(previous) => (previous.label.clone(), Source::Unchanged, true),
+                    None => (l, Source::Heuristic, true),
+                }
+            }
             Decision::Llm { fallback } => {
                 if let Some(cached) = self.cache.get(fp) {
                     (cached, Source::Cache, true)
                 } else if let Some(provider) = self.provider.clone() {
-                    if self
-                        .limiter
-                        .try_acquire(&format!("{}:{id}", self.paths.socket.display()))
-                    {
+                    let budget_key = format!("{}:{id}", self.paths.socket.display());
+                    if self.limiter.try_acquire(&budget_key) {
                         // The screen is read only now: it never enters the fingerprint, so
                         // unchanged panes cost one process_info call and herdr's read-time
                         // side effects (alternate-screen history harvest) stay off idle panes.
@@ -536,6 +548,7 @@ impl Daemon {
                             }
                             Err(e) => {
                                 stats.llm_errors += 1;
+                                self.limiter.back_off(&budget_key);
                                 self.last_error = Some(format!("llm: {e}"));
                                 log_warn!("{id}: llm failed ({e}); fallback {fallback:?}");
                                 (
@@ -569,6 +582,9 @@ impl Daemon {
             }
         };
 
+        if matches!(source, Source::Llm | Source::Cache) {
+            self.tasked.insert(id.clone());
+        }
         if label.is_empty() {
             self.labels.remove(&id);
             return Ok(outcome(None, source, false));
