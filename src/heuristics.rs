@@ -38,6 +38,8 @@ pub struct PaneFacts {
     pub branch: Option<String>,
     pub agent: Option<String>,
     pub agent_status: String,
+    /// The user's request is known: a transcript prompt or the agent's terminal-title summary.
+    pub has_request: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +48,13 @@ pub enum Decision {
     Label(String),
     /// Ask the LLM; use `fallback` when it fails or is unavailable.
     Llm { fallback: String },
+    /// A coding agent with no request yet; the daemon keeps an earlier task label instead.
+    NewSession(String),
 }
 
 const NAMED_AGENTS: &[&str] = &["pika"];
+/// Agents whose transcripts `transcript::prompt_in` reads; keep in sync.
+const TRANSCRIPT_AGENTS: &[&str] = &["claude", "codex", "pi"];
 
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh", "csh", "ash", "elvish", "xonsh",
@@ -465,6 +471,12 @@ pub fn decide(facts: &PaneFacts, max_chars: usize) -> Decision {
         if NAMED_AGENTS.contains(&agent.as_str()) {
             return Decision::Label(fin(&agent));
         }
+        if !facts.has_request
+            && facts.agent_status != "working"
+            && TRANSCRIPT_AGENTS.contains(&agent.as_str())
+        {
+            return Decision::NewSession(fin("New session"));
+        }
         let fallback = fin(if facts.agent_status == "working" {
             "working"
         } else {
@@ -503,15 +515,14 @@ mod tests {
             branch: branch.map(String::from),
             agent: None,
             agent_status: "unknown".into(),
+            has_request: true,
         }
     }
 
     fn label_of(argv: &[&str], cwd: &str, branch: Option<&str>) -> String {
         match decide(&facts(argv, cwd, branch), 24) {
             Decision::Label(l) => l,
-            Decision::Llm { fallback } => {
-                panic!("expected heuristic label, got LLM (fallback {fallback})")
-            }
+            other => panic!("expected heuristic label, got {other:?}"),
         }
     }
 
@@ -679,6 +690,8 @@ mod tests {
         );
         f.agent = Some("pika".into());
         assert_eq!(decide(&f, 24), Decision::Label("pika".into()));
+        f.has_request = false;
+        assert_eq!(decide(&f, 24), Decision::Label("pika".into()));
         let f = facts(
             &[
                 "node",
@@ -700,6 +713,23 @@ mod tests {
             Some("codex")
         );
         assert_eq!(agent_of(&Proc::new(&["node", "server.js"])), None);
+    }
+
+    #[test]
+    fn new_session_only_for_transcript_agents_without_request_or_work() {
+        let mut f = facts(&["claude"], "/x", None);
+        f.has_request = false;
+        f.agent_status = "idle".into();
+        assert_eq!(decide(&f, 24), Decision::NewSession("New session".into()));
+        f.agent_status = "working".into();
+        assert!(matches!(decide(&f, 24), Decision::Llm { .. }));
+        f.agent_status = "unknown".into();
+        assert_eq!(decide(&f, 24), Decision::NewSession("New session".into()));
+        f.has_request = true;
+        assert!(matches!(decide(&f, 24), Decision::Llm { .. }));
+        let mut f = facts(&["gemini"], "/x", None);
+        f.has_request = false;
+        assert!(matches!(decide(&f, 24), Decision::Llm { .. }));
     }
 
     #[test]

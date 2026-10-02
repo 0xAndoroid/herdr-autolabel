@@ -183,10 +183,8 @@ impl Daemon {
                 self.space_fps.insert(id.clone(), fp);
                 (Some(cached), Source::Cache)
             } else if let Some(provider) = &self.provider {
-                if self
-                    .limiter
-                    .try_acquire(&format!("{}:space:{id}", self.paths.socket.display()))
-                {
+                let budget_key = format!("{}:space:{id}", self.paths.socket.display());
+                if self.limiter.try_acquire(&budget_key) {
                     let mut context = String::new();
                     for (pane_id, summary) in &summaries {
                         context.push_str(&format!(
@@ -217,6 +215,7 @@ impl Daemon {
                         }
                         Err(e) => {
                             stats.llm_errors += 1;
+                            self.limiter.back_off(&budget_key);
                             self.last_error = Some(format!("{id}: {e}"));
                             log_warn!("{id}: workspace llm failed: {e}");
                             (fallback(), Source::Fallback)

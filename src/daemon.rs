@@ -223,6 +223,7 @@ impl Daemon {
                 log_info!("shutdown requested");
                 break;
             }
+            let deadline = Instant::now() + interval;
             match self.pass(false) {
                 Ok((stats, _, _)) => {
                     connect_failures = 0;
@@ -244,7 +245,6 @@ impl Daemon {
             }
             self.write_status(true);
             // Sleep in slices so SIGTERM is honoured promptly.
-            let deadline = Instant::now() + interval;
             while Instant::now() < deadline && !SHUTDOWN.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -360,6 +360,7 @@ impl Daemon {
                             project,
                             fingerprint: fingerprint::hash_str(&context),
                             context,
+                            task_session: None,
                         },
                     );
                 }
@@ -406,22 +407,16 @@ impl Daemon {
             .agent_status
             .clone()
             .unwrap_or_else(|| "unknown".into());
-        let facts = PaneFacts {
-            fg: fg.clone(),
-            cwd: cwd.clone(),
-            branch: branch.clone(),
-            agent: pane.agent.clone().filter(|a| !a.is_empty()),
-            agent_status: agent_status.clone(),
-        };
+        let agent = pane.agent.clone().filter(|a| !a.is_empty());
         let session = pane.agent_session.as_ref().filter(|s| !s.value.is_empty());
+        let session_value = session.map_or("", |s| s.value.as_str());
         let prompt = session.and_then(|s| self.prompts.last(s));
         let first_prompt = session
             .filter(|_| prompt.is_some())
             .and_then(|s| self.prompts.first(s))
             .filter(|f| Some(f) != prompt.as_ref());
         let project = heuristics::project(&cwd);
-        let agent_kind = facts
-            .agent
+        let agent_kind = agent
             .clone()
             .or_else(|| fg.as_ref().and_then(heuristics::agent_of));
         // The summary a coding agent keeps in its terminal title — unless that is a status line
@@ -432,6 +427,14 @@ impl Daemon {
                 .filter(|t| !t.trim().is_empty() && !t.to_ascii_lowercase().starts_with(kind))
         });
         let request = prompt.as_deref().or(title);
+        let facts = PaneFacts {
+            fg: fg.clone(),
+            cwd: cwd.clone(),
+            branch: branch.clone(),
+            agent,
+            agent_status: agent_status.clone(),
+            has_request: request.is_some(),
+        };
         let fp = Fingerprint {
             process: fg
                 .as_ref()
@@ -450,7 +453,9 @@ impl Daemon {
             cwd: facts.cwd.clone(),
             branch: facts.branch.clone(),
             agent: facts.agent.clone(),
+            session: session.map(|s| s.value.clone()),
             idle: agent_status == "idle",
+            working: agent_status == "working",
             prompt: prompt.clone(),
             title: title.map(str::to_string),
         }
@@ -496,14 +501,22 @@ impl Daemon {
         let decision = heuristics::decide(&facts, self.config.max_chars);
         let (label, source, record_fp) = match decision {
             Decision::Label(l) => (l, Source::Heuristic, true),
+            Decision::NewSession(l) => {
+                match self
+                    .labels
+                    .get(&id)
+                    .filter(|p| p.task_session.as_deref() == Some(session_value))
+                {
+                    Some(previous) => (previous.label.clone(), Source::Unchanged, true),
+                    None => (l, Source::Heuristic, true),
+                }
+            }
             Decision::Llm { fallback } => {
                 if let Some(cached) = self.cache.get(fp) {
                     (cached, Source::Cache, true)
                 } else if let Some(provider) = self.provider.clone() {
-                    if self
-                        .limiter
-                        .try_acquire(&format!("{}:{id}", self.paths.socket.display()))
-                    {
+                    let budget_key = format!("{}:{id}", self.paths.socket.display());
+                    if self.limiter.try_acquire(&budget_key) {
                         // The screen is read only now: it never enters the fingerprint, so
                         // unchanged panes cost one process_info call and herdr's read-time
                         // side effects (alternate-screen history harvest) stay off idle panes.
@@ -535,6 +548,7 @@ impl Daemon {
                             }
                             Err(e) => {
                                 stats.llm_errors += 1;
+                                self.limiter.back_off(&budget_key);
                                 self.last_error = Some(format!("llm: {e}"));
                                 log_warn!("{id}: llm failed ({e}); fallback {fallback:?}");
                                 (
@@ -574,6 +588,11 @@ impl Daemon {
         }
         if let Some(summary) = self.labels.get_mut(&id) {
             summary.label.clone_from(&label);
+            match source {
+                Source::Llm | Source::Cache => summary.task_session = Some(session_value.into()),
+                Source::Heuristic => summary.task_session = None,
+                _ => {}
+            }
         }
         log_debug!("{id}: fingerprint={fp:016x} source={source:?} label={label:?}");
         if !self.config.label_panes {

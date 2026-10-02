@@ -29,18 +29,21 @@ pub fn hash_str(s: &str) -> u64 {
 }
 
 /// What identifies the task in a pane, hashed into a `u64`. Screen text is deliberately
-/// absent: a pane changes when a new foreground command starts, when an agent flips between
-/// working and idle, or when the request changes: the user's last `prompt` to Claude (from its
-/// transcript), else the `title` a coding agent keeps in the terminal title. A known prompt
-/// stands in for the process, the idle state and the title as well: the pane changes when the
-/// user asks for something new, not while the agent works on it.
+/// absent: a pane changes when a new foreground command starts, when an agent starts a new
+/// session or its state (idle, working, other) changes, or when the request changes: the
+/// user's last `prompt` to Claude (from its transcript), else the `title` a coding agent keeps
+/// in the terminal title. A known prompt stands in for the process, the agent state and the
+/// title as well: the pane changes when the user asks for something new, not while the agent
+/// works on it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Fingerprint {
     pub process: Vec<String>,
     pub cwd: String,
     pub branch: Option<String>,
     pub agent: Option<String>,
+    pub session: Option<String>,
     pub idle: bool,
+    pub working: bool,
     pub prompt: Option<String>,
     pub title: Option<String>,
 }
@@ -54,6 +57,8 @@ impl Fingerprint {
         h.write_u8(1);
         h.write(self.agent.as_deref().unwrap_or("").as_bytes());
         h.write_u8(1);
+        h.write(self.session.as_deref().unwrap_or("").as_bytes());
+        h.write_u8(1);
         if let Some(prompt) = &self.prompt {
             h.write_u8(2);
             h.write(prompt.as_bytes());
@@ -64,7 +69,7 @@ impl Fingerprint {
             h.write_u8(0);
         }
         h.write_u8(1);
-        h.write_u8(u8::from(self.idle));
+        h.write_u8(u8::from(self.idle) | u8::from(self.working) << 1);
         h.write(self.title.as_deref().unwrap_or("").as_bytes());
         h.finish()
     }
@@ -88,6 +93,9 @@ mod tests {
         assert_ne!(base.hash(), other.hash());
         other = base.clone();
         other.idle = true;
+        assert_ne!(base.hash(), other.hash());
+        other = base.clone();
+        other.working = true;
         assert_ne!(base.hash(), other.hash());
         other = base.clone();
         other.process = vec!["cargo".into(), "test".into()];
@@ -115,6 +123,11 @@ mod tests {
         };
         assert_eq!(base.hash(), busy.hash());
         assert_eq!(base.hash(), done.hash());
+        let new_session = Fingerprint {
+            session: Some("s2".into()),
+            ..base.clone()
+        };
+        assert_ne!(base.hash(), new_session.hash());
         let asked_again = Fingerprint {
             prompt: Some("now fix the docs".into()),
             ..base.clone()

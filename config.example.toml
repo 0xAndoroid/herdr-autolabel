@@ -1,7 +1,7 @@
 # herdr-autolabel config — lives at $HERDR_PLUGIN_CONFIG_DIR/config.toml
 # (`herdr plugin config-dir andoroid.autolabel`). Every key is optional.
 
-# Seconds between passes over all panes.
+# Seconds between pass starts over all panes.
 interval_secs = 1
 
 # LLM provider: "auto" (cerebras, else openai, else none, by key presence),
@@ -30,7 +30,7 @@ max_chars = 25
 lines = 40
 
 # Minimum seconds between LLM requests for the same pane or workspace.
-llm_per_pane_secs = 15
+llm_per_pane_secs = 3
 
 # Shared pane/workspace LLM request budget per rolling minute; a rejected reply retries once.
 llm_global_per_min = 6

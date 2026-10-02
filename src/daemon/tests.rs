@@ -274,6 +274,164 @@ fn matching_context_reuses_label_even_when_different_contexts_name_it_the_same()
     finish(&daemon, server);
 }
 
+#[test]
+fn new_session_until_first_prompt_then_one_model_label_per_prompt() {
+    let mut replies = labelled_pane("p1");
+    replies.extend((0..3).flat_map(|_| unchanged_pane()));
+    replies.extend(labelled_pane("p1"));
+    replies.extend((0..3).flat_map(|_| unchanged_pane()));
+    replies.extend(labelled_pane("p1"));
+    let (mut daemon, server) = mock_daemon("new-session", replies);
+    let transcript = daemon.paths.state_dir.join("session.jsonl");
+    let mut pane = PaneInfo {
+        pane_id: "p1".into(),
+        agent: Some("claude".into()),
+        agent_status: Some("idle".into()),
+        agent_session: Some(herdr::AgentSession {
+            agent: "claude".into(),
+            kind: "path".into(),
+            value: transcript.to_string_lossy().into(),
+        }),
+        ..Default::default()
+    };
+    let mut stats = PassStats::default();
+    let mut step = |daemon: &mut Daemon, pane: &mut PaneInfo, source, label: &str| {
+        let outcome = daemon.handle_pane(pane, false, &mut stats).unwrap();
+        assert_eq!(
+            (outcome.source, outcome.label.as_deref()),
+            (source, Some(label))
+        );
+        pane.title = outcome.label;
+    };
+    step(&mut daemon, &mut pane, Source::Heuristic, "New session");
+    for _ in 0..3 {
+        step(&mut daemon, &mut pane, Source::Unchanged, "New session");
+    }
+    assert_eq!(daemon.labels["p1"].label, "New session");
+
+    let user =
+        |text: &str| format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#);
+    std::fs::write(&transcript, user("fix the sidebar labels") + "\n").unwrap();
+    step(&mut daemon, &mut pane, Source::Fallback, "ready");
+    for _ in 0..3 {
+        step(&mut daemon, &mut pane, Source::Unchanged, "ready");
+    }
+
+    let next = "add a new session label";
+    let fp = Fingerprint {
+        agent: Some("claude".into()),
+        session: Some(transcript.to_string_lossy().into()),
+        prompt: Some(next.into()),
+        ..Default::default()
+    }
+    .hash();
+    daemon.cache.insert(fp, "New session label".into());
+    std::fs::write(
+        &transcript,
+        user("fix the sidebar labels") + "\n" + &user(next) + "\n",
+    )
+    .unwrap();
+    step(&mut daemon, &mut pane, Source::Cache, "New session label");
+
+    let seen = finish(&daemon, server);
+    assert!(seen.iter().all(|r| r["method"] != "pane.read"));
+}
+
+#[test]
+fn new_session_leaves_on_work_and_never_replaces_a_task_label() {
+    let mut replies: Vec<_> = (0..3).flat_map(|_| labelled_pane("p1")).collect();
+    replies.extend((0..2).flat_map(|_| unchanged_pane()));
+    replies.extend(labelled_pane("p1"));
+    let (mut daemon, server) = mock_daemon("new-session-task", replies);
+    let fp = Fingerprint {
+        agent: Some("claude".into()),
+        working: true,
+        title: Some("Fix parser".into()),
+        ..Default::default()
+    }
+    .hash();
+    daemon.cache.insert(fp, "Fix parser".into());
+    let mut pane = PaneInfo {
+        pane_id: "p1".into(),
+        agent: Some("claude".into()),
+        ..Default::default()
+    };
+    let mut stats = PassStats::default();
+    for (session, status, title, source, label) in [
+        ("", None, None, Source::Heuristic, "New session"),
+        ("", Some("working"), None, Source::Fallback, "working"),
+        (
+            "",
+            Some("working"),
+            Some("Fix parser"),
+            Source::Cache,
+            "Fix parser",
+        ),
+        ("", Some("idle"), None, Source::Unchanged, "Fix parser"),
+        ("", Some("idle"), None, Source::Unchanged, "Fix parser"),
+        (
+            "/missing/s2.jsonl",
+            Some("idle"),
+            None,
+            Source::Heuristic,
+            "New session",
+        ),
+    ] {
+        pane.agent_session = Some(herdr::AgentSession {
+            agent: "claude".into(),
+            kind: "path".into(),
+            value: session.into(),
+        });
+        pane.agent_status = status.map(String::from);
+        pane.terminal_title_stripped = title.map(String::from);
+        let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
+        assert_eq!(
+            (outcome.source, outcome.label.as_deref()),
+            (source, Some(label))
+        );
+        pane.title = outcome.label;
+    }
+    assert_eq!(stats.llm_calls, 0);
+    let seen = finish(&daemon, server);
+    assert!(seen.iter().all(|r| r["method"] != "pane.read"));
+}
+
+#[test]
+fn foreign_title_never_becomes_our_task_label() {
+    let mut replies = labelled_pane("p1");
+    replies.push(("pane.report_metadata", json!({"result": {"type": "ok"}})));
+    replies.extend(labelled_pane("p1"));
+    let (mut daemon, server) = mock_daemon("foreign-task", replies);
+    let fp = Fingerprint {
+        agent: Some("claude".into()),
+        working: true,
+        title: Some("Fix parser".into()),
+        ..Default::default()
+    }
+    .hash();
+    daemon.cache.insert(fp, "Fix parser".into());
+    let mut pane = PaneInfo {
+        pane_id: "p1".into(),
+        agent: Some("claude".into()),
+        agent_status: Some("working".into()),
+        terminal_title_stripped: Some("Fix parser".into()),
+        ..Default::default()
+    };
+    let mut stats = PassStats::default();
+    let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
+    assert_eq!(outcome.source, Source::Cache);
+    pane.title = Some("Other task".into());
+    let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
+    assert_eq!(outcome.source, Source::SkippedTitle);
+    assert_eq!(daemon.labels["p1"].task_session, None);
+    pane.title = None;
+    pane.agent_status = Some("idle".into());
+    pane.terminal_title_stripped = None;
+    let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
+    assert_eq!(outcome.label.as_deref(), Some("New session"));
+    finish(&daemon, server);
+}
+
 fn ws(id: &str, label: &str, focused: bool) -> serde_json::Value {
     json!({"workspace_id": id, "label": label, "focused": focused, "pane_count": 1, "tokens": {herdr::FOLDER_TOKEN: if id == "w1" { "pika" } else { "jolt" }}})
 }
@@ -338,7 +496,7 @@ fn pika_identity_has_no_folder_and_clears_when_replaced() {
     );
     assert_eq!(
         daemon.pass(false).unwrap().1[0].label.as_deref(),
-        Some("ready")
+        Some("New session")
     );
     let seen = finish(&daemon, server);
     assert_eq!(seen[1]["params"]["display_agent"], "pika TUI");
