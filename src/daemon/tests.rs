@@ -274,6 +274,68 @@ fn matching_context_reuses_label_even_when_different_contexts_name_it_the_same()
     finish(&daemon, server);
 }
 
+#[test]
+fn new_session_until_first_prompt_then_one_model_label_per_prompt() {
+    let mut replies = labelled_pane("p1");
+    replies.extend((0..3).flat_map(|_| unchanged_pane()));
+    replies.extend(labelled_pane("p1"));
+    replies.extend((0..3).flat_map(|_| unchanged_pane()));
+    replies.extend(labelled_pane("p1"));
+    let (mut daemon, server) = mock_daemon("new-session", replies);
+    let transcript = daemon.paths.state_dir.join("session.jsonl");
+    let mut pane = PaneInfo {
+        pane_id: "p1".into(),
+        agent: Some("claude".into()),
+        agent_status: Some("idle".into()),
+        agent_session: Some(herdr::AgentSession {
+            agent: "claude".into(),
+            kind: "path".into(),
+            value: transcript.to_string_lossy().into(),
+        }),
+        ..Default::default()
+    };
+    let mut stats = PassStats::default();
+    let mut step = |daemon: &mut Daemon, pane: &mut PaneInfo, source, label: &str| {
+        let outcome = daemon.handle_pane(pane, false, &mut stats).unwrap();
+        assert_eq!(
+            (outcome.source, outcome.label.as_deref()),
+            (source, Some(label))
+        );
+        pane.title = outcome.label;
+    };
+    step(&mut daemon, &mut pane, Source::Heuristic, "New session");
+    for _ in 0..3 {
+        step(&mut daemon, &mut pane, Source::Unchanged, "New session");
+    }
+    assert_eq!(daemon.labels["p1"].label, "New session");
+
+    let user =
+        |text: &str| format!(r#"{{"type":"user","message":{{"role":"user","content":"{text}"}}}}"#);
+    std::fs::write(&transcript, user("fix the sidebar labels") + "\n").unwrap();
+    step(&mut daemon, &mut pane, Source::Fallback, "ready");
+    for _ in 0..3 {
+        step(&mut daemon, &mut pane, Source::Unchanged, "ready");
+    }
+
+    let next = "add a new session label";
+    let fp = Fingerprint {
+        agent: Some("claude".into()),
+        prompt: Some(next.into()),
+        ..Default::default()
+    }
+    .hash();
+    daemon.cache.insert(fp, "New session label".into());
+    std::fs::write(
+        &transcript,
+        user("fix the sidebar labels") + "\n" + &user(next) + "\n",
+    )
+    .unwrap();
+    step(&mut daemon, &mut pane, Source::Cache, "New session label");
+
+    let seen = finish(&daemon, server);
+    assert!(seen.iter().all(|r| r["method"] != "pane.read"));
+}
+
 fn ws(id: &str, label: &str, focused: bool) -> serde_json::Value {
     json!({"workspace_id": id, "label": label, "focused": focused, "pane_count": 1, "tokens": {herdr::FOLDER_TOKEN: if id == "w1" { "pika" } else { "jolt" }}})
 }
@@ -338,7 +400,7 @@ fn pika_identity_has_no_folder_and_clears_when_replaced() {
     );
     assert_eq!(
         daemon.pass(false).unwrap().1[0].label.as_deref(),
-        Some("ready")
+        Some("New session")
     );
     let seen = finish(&daemon, server);
     assert_eq!(seen[1]["params"]["display_agent"], "pika TUI");

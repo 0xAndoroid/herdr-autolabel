@@ -23,7 +23,7 @@ pub struct RateLimiter {
 impl RateLimiter {
     pub fn new(per_pane_min: Duration, global_per_min: u32, path: PathBuf) -> Self {
         Self {
-            per_pane_min: per_pane_min.max(Duration::from_secs(15)),
+            per_pane_min: per_pane_min.max(Duration::from_secs(3)),
             capacity: global_per_min.clamp(1, 6) as usize,
             path,
         }
@@ -112,6 +112,16 @@ mod tests {
         assert!(!other.acquire_at("p1", 5_000).unwrap());
         assert!(other.acquire_at("p2", 5_000).unwrap());
         assert!(other.acquire_at("p1", 15_000).unwrap());
+        clean(&rl);
+    }
+
+    #[test]
+    fn per_pane_spacing_of_three_seconds() {
+        let path = std::env::temp_dir().join(format!("hal-budget-3s-{}.json", std::process::id()));
+        let rl = RateLimiter::new(Duration::from_secs(3), 6, path);
+        assert!(rl.acquire_at("p1", 0).unwrap());
+        assert!(!rl.acquire_at("p1", 2_999).unwrap());
+        assert!(rl.acquire_at("p1", 3_000).unwrap());
         clean(&rl);
     }
 

@@ -223,6 +223,7 @@ impl Daemon {
                 log_info!("shutdown requested");
                 break;
             }
+            let deadline = Instant::now() + interval;
             match self.pass(false) {
                 Ok((stats, _, _)) => {
                     connect_failures = 0;
@@ -244,7 +245,6 @@ impl Daemon {
             }
             self.write_status(true);
             // Sleep in slices so SIGTERM is honoured promptly.
-            let deadline = Instant::now() + interval;
             while Instant::now() < deadline && !SHUTDOWN.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -406,13 +406,7 @@ impl Daemon {
             .agent_status
             .clone()
             .unwrap_or_else(|| "unknown".into());
-        let facts = PaneFacts {
-            fg: fg.clone(),
-            cwd: cwd.clone(),
-            branch: branch.clone(),
-            agent: pane.agent.clone().filter(|a| !a.is_empty()),
-            agent_status: agent_status.clone(),
-        };
+        let agent = pane.agent.clone().filter(|a| !a.is_empty());
         let session = pane.agent_session.as_ref().filter(|s| !s.value.is_empty());
         let prompt = session.and_then(|s| self.prompts.last(s));
         let first_prompt = session
@@ -420,8 +414,7 @@ impl Daemon {
             .and_then(|s| self.prompts.first(s))
             .filter(|f| Some(f) != prompt.as_ref());
         let project = heuristics::project(&cwd);
-        let agent_kind = facts
-            .agent
+        let agent_kind = agent
             .clone()
             .or_else(|| fg.as_ref().and_then(heuristics::agent_of));
         // The summary a coding agent keeps in its terminal title — unless that is a status line
@@ -432,6 +425,14 @@ impl Daemon {
                 .filter(|t| !t.trim().is_empty() && !t.to_ascii_lowercase().starts_with(kind))
         });
         let request = prompt.as_deref().or(title);
+        let facts = PaneFacts {
+            fg: fg.clone(),
+            cwd: cwd.clone(),
+            branch: branch.clone(),
+            agent,
+            agent_status: agent_status.clone(),
+            has_request: request.is_some(),
+        };
         let fp = Fingerprint {
             process: fg
                 .as_ref()

@@ -35,7 +35,7 @@ impl Default for Config {
             debug: false,
             max_chars: 25,
             lines: 40,
-            llm_per_pane_secs: 15,
+            llm_per_pane_secs: 3,
             llm_global_per_min: 6,
             allow: Vec::new(),
             deny: Vec::new(),
@@ -104,7 +104,7 @@ impl Config {
         validate!(interval_secs, 1..=86400);
         validate!(max_chars, 4..=80);
         validate!(lines, 1..=200);
-        validate!(llm_per_pane_secs, 15..=86400);
+        validate!(llm_per_pane_secs, 3..=86400);
         validate!(llm_global_per_min, 1..=6);
         self.provider = self.provider.trim().to_ascii_lowercase();
     }
@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(c.model, None);
         assert_eq!(c.max_chars, 25);
         assert_eq!(c.lines, 40);
-        assert_eq!(c.llm_per_pane_secs, 15);
+        assert_eq!(c.llm_per_pane_secs, 3);
         assert_eq!(c.llm_global_per_min, 6);
         assert!(c.allow.is_empty() && c.deny.is_empty());
         assert!(c.label_panes && c.label_spaces);
@@ -208,7 +208,7 @@ mod tests {
         let c = Config::parse("provider = \"none\"\ninterval_secs = 0\nllm_per_pane_secs = 0\nllm_global_per_min = 100").unwrap();
         assert_eq!(c.provider, "none");
         assert_eq!(c.interval_secs, 1);
-        assert_eq!(c.llm_per_pane_secs, 15);
+        assert_eq!(c.llm_per_pane_secs, 3);
         assert_eq!(c.llm_global_per_min, 6);
     }
 
