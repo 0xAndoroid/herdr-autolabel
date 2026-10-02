@@ -167,8 +167,6 @@ pub struct Daemon {
     spaces: SpaceStates,
     space_fps: HashMap<String, u64>,
     cleared: HashSet<String>,
-    /// Panes whose current agent has had a task label from the model or the cache.
-    tasked: HashSet<String>,
     started_at: String,
     pass_count: u64,
     total_llm_calls: u64,
@@ -196,7 +194,6 @@ impl Daemon {
             spaces: SpaceStates::new(),
             space_fps: HashMap::new(),
             cleared: HashSet::new(),
-            tasked: HashSet::new(),
             started_at: crate::logging::timestamp(),
             pass_count: 0,
             total_llm_calls: 0,
@@ -276,7 +273,6 @@ impl Daemon {
         self.applied.retain(|k, _| alive.contains(k));
         self.labels.retain(|k, _| alive.contains(k));
         self.cleared.retain(|k| alive.contains(k));
-        self.tasked.retain(|k| alive.contains(k));
 
         for pane in &snapshot.panes {
             if SHUTDOWN.load(Ordering::Relaxed) {
@@ -364,6 +360,7 @@ impl Daemon {
                             project,
                             fingerprint: fingerprint::hash_str(&context),
                             context,
+                            task_session: None,
                         },
                     );
                 }
@@ -412,6 +409,7 @@ impl Daemon {
             .unwrap_or_else(|| "unknown".into());
         let agent = pane.agent.clone().filter(|a| !a.is_empty());
         let session = pane.agent_session.as_ref().filter(|s| !s.value.is_empty());
+        let session_value = session.map_or("", |s| s.value.as_str());
         let prompt = session.and_then(|s| self.prompts.last(s));
         let first_prompt = session
             .filter(|_| prompt.is_some())
@@ -455,6 +453,7 @@ impl Daemon {
             cwd: facts.cwd.clone(),
             branch: facts.branch.clone(),
             agent: facts.agent.clone(),
+            session: session.map(|s| s.value.clone()),
             idle: agent_status == "idle",
             working: agent_status == "working",
             prompt: prompt.clone(),
@@ -501,12 +500,13 @@ impl Daemon {
 
         let decision = heuristics::decide(&facts, self.config.max_chars);
         let (label, source, record_fp) = match decision {
-            Decision::Label(l) => {
-                self.tasked.remove(&id);
-                (l, Source::Heuristic, true)
-            }
+            Decision::Label(l) => (l, Source::Heuristic, true),
             Decision::NewSession(l) => {
-                match self.labels.get(&id).filter(|_| self.tasked.contains(&id)) {
+                match self
+                    .labels
+                    .get(&id)
+                    .filter(|p| p.task_session.as_deref() == Some(session_value))
+                {
                     Some(previous) => (previous.label.clone(), Source::Unchanged, true),
                     None => (l, Source::Heuristic, true),
                 }
@@ -582,15 +582,17 @@ impl Daemon {
             }
         };
 
-        if matches!(source, Source::Llm | Source::Cache) {
-            self.tasked.insert(id.clone());
-        }
         if label.is_empty() {
             self.labels.remove(&id);
             return Ok(outcome(None, source, false));
         }
         if let Some(summary) = self.labels.get_mut(&id) {
             summary.label.clone_from(&label);
+            match source {
+                Source::Llm | Source::Cache => summary.task_session = Some(session_value.into()),
+                Source::Heuristic => summary.task_session = None,
+                _ => {}
+            }
         }
         log_debug!("{id}: fingerprint={fp:016x} source={source:?} label={label:?}");
         if !self.config.label_panes {

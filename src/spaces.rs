@@ -18,6 +18,8 @@ pub struct PaneSummary {
     pub project: Option<String>,
     pub context: String,
     pub fingerprint: u64,
+    /// The agent session (`""` without one) whose task this model or cached label names.
+    pub task_session: Option<String>,
 }
 
 pub fn fallback(panes: &[(&str, &PaneSummary)], max_chars: usize) -> Option<String> {

@@ -104,10 +104,17 @@ impl RateLimiter {
         }
     }
 
-    /// Call after a failed or rejected request.
+    /// Call after a failed or rejected request. Retries briefly while another process holds
+    /// the budget lock: a dropped backoff would let the target retry after `per_pane_min`.
     pub fn back_off(&self, pane: &str) {
-        if let Err(e) = self.back_off_at(pane, now_ms()) {
-            crate::logging::log_warn!("LLM budget unavailable ({e}); backoff not recorded");
+        let mut attempts = 1;
+        while let Err(e) = self.back_off_at(pane, now_ms()) {
+            if attempts == 5 {
+                crate::logging::log_warn!("LLM budget unavailable ({e}); backoff not recorded");
+                return;
+            }
+            attempts += 1;
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -169,6 +176,31 @@ mod tests {
         assert!(rl.acquire_at("p2", 4_000).unwrap());
         assert!(!rl.acquire_at("p1", 15_999).unwrap());
         assert!(rl.acquire_at("p1", 16_000).unwrap());
+        clean(&rl);
+    }
+
+    #[test]
+    fn backoff_waits_out_a_briefly_held_lock() {
+        let path =
+            std::env::temp_dir().join(format!("hal-budget-held-{}.json", std::process::id()));
+        let rl = RateLimiter::new(Duration::from_secs(3), 6, path);
+        let holder = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(rl.path.with_extension("lock"))
+            .unwrap();
+        // SAFETY: `holder` is open for the duration of the call.
+        assert_eq!(unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            drop(holder);
+        });
+        rl.back_off("p1");
+        release.join().unwrap();
+        let now = now_ms();
+        assert!(!rl.acquire_at("p1", now + 4_000).unwrap());
+        assert!(rl.acquire_at("p1", now + 15_000).unwrap());
         clean(&rl);
     }
 
