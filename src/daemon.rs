@@ -416,15 +416,24 @@ impl Daemon {
             .and_then(|s| self.prompts.first(s))
             .filter(|f| Some(f) != prompt.as_ref());
         let project = heuristics::project(&cwd);
+        let cwd_base = heuristics::directory_name(&cwd);
         let agent_kind = agent
             .clone()
             .or_else(|| fg.as_ref().and_then(heuristics::agent_of));
-        // The summary a coding agent keeps in its terminal title — unless that is a status line
-        // of the agent's own ("pika — idle").
         let title = agent_kind.as_deref().and_then(|kind| {
             pane.terminal_title_stripped
                 .as_deref()
-                .filter(|t| !t.trim().is_empty() && !t.to_ascii_lowercase().starts_with(kind))
+                .map(str::trim)
+                .filter(|t| {
+                    !t.is_empty()
+                        && !t.to_ascii_lowercase().starts_with(kind)
+                        && *t != cwd
+                        && *t != cwd_base
+                        && Some(*t) != project.as_deref()
+                        && !t.split_once(':').is_some_and(|(host, path)| {
+                            host.contains('@') && path.starts_with(['/', '~'])
+                        })
+                })
         });
         let request = prompt.as_deref().or(title);
         let facts = PaneFacts {
@@ -463,7 +472,6 @@ impl Daemon {
 
         let fg_cmdline = fg.as_ref().map(|p| p.argv.join(" "));
         let child_cmdline = child.as_ref().map(|p| p.argv.join(" "));
-        let cwd_base = heuristics::directory_name(&cwd);
         let ctx = llm::Context {
             agent: agent_kind.as_deref(),
             agent_status: agent_kind.as_ref().map(|_| agent_status.as_str()),

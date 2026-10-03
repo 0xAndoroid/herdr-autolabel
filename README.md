@@ -35,7 +35,7 @@ The `[[startup]]` hook runs on every herdr server start (and live handoff) and s
 
 - **Idle shell:** `shell`. Folder and branch are separate metadata, never the task name.
 - **Known process:** a deterministic command such as `cargo build`, `nvim foo.rs`, or `SSH host`; no pane LLM request. The SSH alias `macmini` displays as `Mac Mini`. Uses the foreground process group leader, not a child it spawned.
-- **New agent session:** `New session`, with no LLM request, for a Claude, Codex or Pi pane that is not working and has neither a transcript prompt nor a terminal-title summary yet. The first prompt, title or working state switches it to the LLM path below; a pane that already had a task label keeps it.
+- **New agent session:** `New session`, with no LLM request, for a Claude, Codex or Pi pane that is not working and has neither a transcript prompt nor a terminal-title summary yet. Folder names, the current directory path, and shell `user@host:path` titles do not count as task summaries. The first prompt, task title or working state switches it to the LLM path below; a pane that already had a task label keeps it.
 - **Coding agent or unknown process:** the LLM describes the task only, without a project prefix. Context includes the latest substantive user prompt, first prompt, session title, command, repository, branch, and last 40 visible rows. Claude, Codex, and Pi prompts come from their local transcripts; Codex supports both `user_message` events and user `response_item` records, excluding injected instructions. Other agents use terminal titles. Unchanged tasks retain their names while the agent works. Pika TUI panes use `pika` directly.
 - **Manual pane name:** preserved. Other sources' titles are also respected. Filtered panes contribute no context to workspace requests.
 
@@ -45,7 +45,7 @@ Titles use `pane.report_metadata` with source `plugin:autolabel`. `label_panes =
 
 ## Space labels
 
-A space containing Pika is always named `pika` automatically, even with other panes present. A space whose only non-shell task is SSH uses its exact task name, such as `SSH Mac Mini`. Neither case calls the workspace LLM.
+A space containing Pika is always named `pika` automatically, even with other panes present. A space whose only non-shell task is SSH uses its exact task name, such as `SSH Mac Mini`. An all-shell space is named `shell`, ignoring cached model names and old terminal output. These cases do not call the workspace LLM.
 
 Other workspaces get an LLM-written description of **all allowed panes**, not the first or focused agent. Every included pane supplies its task label, request/session context, command, folder, branch, and fresh visible output when available. The prompt asks for a shared purpose, or a short description covering distinct tasks; it gives active tasks more weight than idle shells. Names omit the folder and branch shown on the second row.
 

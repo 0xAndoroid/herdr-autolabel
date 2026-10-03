@@ -275,6 +275,59 @@ fn matching_context_reuses_label_even_when_different_contexts_name_it_the_same()
 }
 
 #[test]
+fn new_session_ignores_inherited_directory_and_shell_titles() {
+    for (cwd, title, source, label) in [
+        ("/repo/pika", "pika", Source::Heuristic, "New session"),
+        ("/repo/pika", "/repo/pika", Source::Heuristic, "New session"),
+        (
+            "/repo/.dotfiles",
+            "dotfiles",
+            Source::Heuristic,
+            "New session",
+        ),
+        (
+            "/repo/pika",
+            "user@host:~/dev/pika",
+            Source::Heuristic,
+            "New session",
+        ),
+        (
+            "/repo/pika",
+            "user@host:~/dev/pika > codex",
+            Source::Heuristic,
+            "New session",
+        ),
+        ("/repo/pika", "Fix pika labels", Source::Fallback, "ready"),
+        (
+            "/repo/pika",
+            "Fix parser: /repo/pika",
+            Source::Fallback,
+            "ready",
+        ),
+    ] {
+        let (mut daemon, server) = mock_daemon("inherited-title", labelled_pane("p1"));
+        let pane = PaneInfo {
+            pane_id: "p1".into(),
+            cwd: Some(cwd.into()),
+            agent: Some("codex".into()),
+            agent_status: Some("idle".into()),
+            terminal_title_stripped: Some(title.into()),
+            ..Default::default()
+        };
+        let mut stats = PassStats::default();
+        let outcome = daemon.handle_pane(&pane, false, &mut stats).unwrap();
+        let seen = finish(&daemon, server);
+        assert_eq!(
+            (outcome.source, outcome.label.as_deref()),
+            (source, Some(label)),
+            "{title}"
+        );
+        assert_eq!(stats.llm_calls, 0);
+        assert_eq!(seen[2]["params"]["title"], label);
+    }
+}
+
+#[test]
 fn new_session_until_first_prompt_then_one_model_label_per_prompt() {
     let mut replies = labelled_pane("p1");
     replies.extend((0..3).flat_map(|_| unchanged_pane()));
@@ -600,6 +653,71 @@ fn ssh_space_keeps_destination_instead_of_cached_generic_name() {
     assert_eq!(stats.llm_calls, 0);
     let seen = finish(&daemon, server);
     assert_eq!(seen.last().unwrap()["params"]["label"], "SSH Mac Mini");
+}
+
+#[test]
+fn shell_space_replaces_cached_agent_name() {
+    for unchanged in [false, true] {
+        let old = "Pika Codex session";
+        let snapshot: Snapshot = serde_json::from_value(
+            snapshot(
+                vec![
+                    pane_json("w1:p1", "w1", "/x/pika", true, None),
+                    pane_json("w1:p2", "w1", "/x/pika", false, None),
+                ],
+                vec![ws("w1", old, true)],
+            )["result"]["snapshot"]
+                .clone(),
+        )
+        .unwrap();
+        let (mut daemon, server) = mock_daemon(
+            "shell-space",
+            vec![
+                (
+                    "workspace.get",
+                    json!({"result": {"workspace": {"label": old}}}),
+                ),
+                ("workspace.rename", json!({"result": {"type": "ok"}})),
+            ],
+        );
+        for id in ["w1:p1", "w1:p2"] {
+            daemon.labels.insert(
+                id.into(),
+                PaneSummary {
+                    label: "shell".into(),
+                    project: Some("pika".into()),
+                    ..Default::default()
+                },
+            );
+        }
+        daemon.spaces.insert(
+            "w1".into(),
+            spaces::SpaceState {
+                original: "pika".into(),
+                applied: Some(old.into()),
+                pending: None,
+            },
+        );
+        spaces::save_states(&daemon.paths.spaces_file(), &daemon.spaces).unwrap();
+        let fp = spaces::fingerprint(&[
+            ("w1:p1", &daemon.labels["w1:p1"]),
+            ("w1:p2", &daemon.labels["w1:p2"]),
+        ]);
+        daemon.cache.insert(fp, old.into());
+        if unchanged {
+            daemon.space_fps.insert("w1".into(), fp);
+        }
+        let mut stats = PassStats::default();
+        let pending = daemon.handle_spaces(&snapshot, false, &mut stats).unwrap();
+        assert_eq!(pending[0].source, Source::Pending);
+        let result = daemon.handle_spaces(&snapshot, false, &mut stats).unwrap();
+        assert_eq!(result[0].label.as_deref(), Some("shell"));
+        assert_eq!(result[0].source, Source::Heuristic);
+        assert!(result[0].applied);
+        assert_eq!(stats.llm_calls, 0);
+        let seen = finish(&daemon, server);
+        assert_eq!(seen.last().unwrap()["params"]["label"], "shell");
+    }
 }
 
 #[test]

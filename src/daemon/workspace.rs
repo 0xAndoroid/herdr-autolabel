@@ -170,7 +170,7 @@ impl Daemon {
                 Some("pika".to_string())
             } else {
                 spaces::fallback(&summaries, self.config.max_chars)
-                    .filter(|s| s.starts_with("SSH "))
+                    .filter(|s| s == "shell" || s.starts_with("SSH "))
             };
             let (candidate, source) = if let Some(name) = direct {
                 self.space_fps.remove(id);
