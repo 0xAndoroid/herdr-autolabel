@@ -124,3 +124,5 @@ macOS + Linux.
 - Heuristics look at the command typed at the prompt (the foreground process group leader; else the first non-shell process); pipelines label by their first command.
 - Coding-agent panes use task-only `working`/`ready` fallbacks without a provider; Pika panes use `pika`.
 - Labels reflect the visible screen (its last 40 rows); a long-idle agent keeps its last label until its command, state or request changes.
+
+> **Archived.** This plugin now lives in [0xAndoroid/pika](https://github.com/0xAndoroid/pika) at `crates/herdr-autolabel` (imported from this repository at `ebc40b01bda04b8b31c54646e8f5f479932718fb`, pika PR #480) and ships in the signed pika-shim bundle.
