@@ -160,7 +160,7 @@ impl Daemon {
                 .as_ref()
                 .map(|(s, _)| s.clone())
                 .or_else(|| state.applied.clone())
-                .filter(|s| !llm::postprocess(s, self.config.max_chars).is_empty());
+                .filter(|s| llm::postprocess(s, self.config.max_chars).is_ok());
             let fallback = || {
                 previous
                     .clone()

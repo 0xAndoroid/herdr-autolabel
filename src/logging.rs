@@ -41,10 +41,13 @@ macro_rules! log_info {
 macro_rules! log_warn {
     ($($arg:tt)*) => { $crate::logging::emit("WARN", &format!($($arg)*)) };
 }
+macro_rules! log_error {
+    ($($arg:tt)*) => { $crate::logging::emit("ERROR", &format!($($arg)*)) };
+}
 macro_rules! log_debug {
     ($($arg:tt)*) => { if $crate::logging::debug_enabled() { $crate::logging::emit("DEBUG", &format!($($arg)*)) } };
 }
-pub(crate) use {log_debug, log_info, log_warn};
+pub(crate) use {log_debug, log_error, log_info, log_warn};
 
 /// RFC 3339 UTC timestamp without external crates.
 pub fn timestamp() -> String {

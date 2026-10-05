@@ -1,12 +1,14 @@
 #![expect(clippy::unwrap_used)]
 
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 struct Session {
     root: PathBuf,
@@ -134,4 +136,66 @@ fn malformed_config_is_fatal() {
         !session.root.join("daemon.log").exists(),
         "start spawned a daemon"
     );
+}
+
+#[test]
+fn new_session_replaced_when_model_rate_limited() {
+    let session = Session::new("placeholder");
+    fs::write(
+        session.root.join("config.toml"),
+        "provider = \"cerebras\"\nlabel_spaces = false",
+    )
+    .unwrap();
+    let socket = session.root.join("absent.sock");
+    fs::write(
+        session.root.join("llm-budget.json"),
+        json!({"next_call": {format!("{}:p1", socket.display()): u64::MAX}}).to_string(),
+    )
+    .unwrap();
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut daemon = session
+        .command("daemon")
+        .env("CEREBRAS_API_KEY", "test-key")
+        .spawn()
+        .unwrap();
+    let mut pane = json!({"pane_id": "p1", "agent": "codex", "agent_status": "idle"});
+    let mut titles = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while titles.len() < 2 && Instant::now() < deadline {
+        let (mut stream, _) = match listener.accept() {
+            Ok(connection) => connection,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            Err(e) => unreachable!("{e}"),
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        let result = match request["method"].as_str().unwrap() {
+            "session.snapshot" => json!({"snapshot": {"panes": [pane]}}),
+            "pane.process_info" => json!({"process_info": {}}),
+            "pane.get" => json!({"pane": pane}),
+            "pane.report_metadata" => {
+                if let Some(title) = request["params"]["title"].as_str() {
+                    titles.push(title.to_string());
+                    pane["title"] = json!(title);
+                    pane["agent_status"] = json!("working");
+                }
+                json!({"type": "ok"})
+            }
+            method => unreachable!("unexpected method: {method}"),
+        };
+        writeln!(stream, "{}", json!({"id": request["id"], "result": result})).unwrap();
+    }
+    daemon.kill().unwrap();
+    daemon.wait().unwrap();
+    assert_eq!(titles, ["New session", "working"]);
 }

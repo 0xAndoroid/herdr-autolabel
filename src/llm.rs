@@ -89,7 +89,7 @@ impl fmt::Display for Provider {
 pub enum Error {
     Http(String),
     Empty,
-    InvalidLabel,
+    InvalidLabel(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -97,7 +97,7 @@ impl fmt::Display for Error {
         match self {
             Error::Http(m) => write!(f, "{m}"),
             Error::Empty => write!(f, "empty completion"),
-            Error::InvalidLabel => write!(f, "invalid label (count or over length limit)"),
+            Error::InvalidLabel(reason) => write!(f, "invalid label: {reason}"),
         }
     }
 }
@@ -367,9 +367,6 @@ impl Provider {
         }
         let text = self.extract(&body).unwrap_or_default();
         crate::logging::log_debug!("llm raw reply: {:?}", scrub::scrub_line(&text));
-        if text.trim().is_empty() {
-            return Err(Error::Empty);
-        }
         Ok(text)
     }
 
@@ -382,7 +379,7 @@ impl Provider {
     }
 
     fn generate(&self, user: &str, prompt: &str, max_chars: usize) -> Result<String, Error> {
-        let system = format!(
+        let mut system = format!(
             "{prompt} Keep the name within {max_chars} characters. Output the name, never its length."
         );
         crate::logging::log_debug!(
@@ -393,39 +390,35 @@ impl Provider {
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        for retry in [false, true] {
-            let retry_system;
-            let instructions = if retry {
-                retry_system = format!(
-                    "{system} The previous reply was invalid. Return a shorter concrete task name, without counts or explanation."
-                );
-                &retry_system
-            } else {
-                &system
-            };
+        let mut retry = false;
+        loop {
             let result = self
-                .complete_with(user, instructions, retry)
+                .complete_with(user, &system, retry)
                 .and_then(|raw| {
-                    let cleaned = postprocess(&raw, max_chars);
-                    if cleaned.is_empty() {
-                        Err(Error::InvalidLabel)
-                    } else {
-                        Ok(cleaned)
-                    }
+                    postprocess(&raw, max_chars).inspect_err(|error| {
+                        crate::logging::log_error!(
+                            "llm {self}: rejected reply attempt={}/2 reason={error} max_chars={max_chars} reply={:?}",
+                            u8::from(retry) + 1,
+                            scrub::scrub_line(&raw)
+                        );
+                    })
                 });
             match result {
-                Err(Error::Empty | Error::InvalidLabel) if !retry => {
-                    crate::logging::log_debug!("llm rejected reply; retrying once");
+                Err(error @ (Error::Empty | Error::InvalidLabel(_))) if !retry => {
+                    crate::logging::log_info!("llm {self}: retrying rejected reply (attempt 2/2)");
+                    system.push_str(&format!(
+                        " The previous reply was rejected: {error}. Return a shorter concrete task name, without counts or explanation."
+                    ));
+                    retry = true;
                 }
                 other => return other,
             }
         }
-        Err(Error::InvalidLabel)
     }
 }
 
 /// Takes the first label line, never a trailing length calculation.
-pub fn postprocess(raw: &str, max_chars: usize) -> String {
+pub fn postprocess(raw: &str, max_chars: usize) -> Result<String, Error> {
     let candidate = raw
         .lines()
         .map(str::trim)
@@ -436,6 +429,15 @@ pub fn postprocess(raw: &str, max_chars: usize) -> String {
         .or_else(|| candidate.strip_prefix("label:"))
         .unwrap_or(candidate);
     let cleaned = label::finalize(candidate, usize::MAX, usize::MAX);
+    if cleaned.is_empty() {
+        return Err(Error::Empty);
+    }
+    if cleaned.chars().count() > max_chars {
+        return Err(Error::InvalidLabel("over length limit"));
+    }
+    if !cleaned.chars().any(char::is_alphabetic) {
+        return Err(Error::InvalidLabel("no alphabetic characters"));
+    }
     let lower = cleaned.to_lowercase();
     let count_words = [
         "name",
@@ -461,16 +463,13 @@ pub fn postprocess(raw: &str, max_chars: usize) -> String {
         "within",
         "only",
     ];
-    if cleaned.chars().count() > max_chars
-        || !cleaned.chars().any(char::is_alphabetic)
-        || lower.split_whitespace().all(|word| {
-            let word = word.trim_matches(|c: char| !c.is_alphanumeric());
-            word.chars().all(|c| c.is_ascii_digit()) || count_words.contains(&word)
-        })
-    {
-        return String::new();
+    if lower.split_whitespace().all(|word| {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric());
+        word.chars().all(|c| c.is_ascii_digit()) || count_words.contains(&word)
+    }) {
+        return Err(Error::InvalidLabel("count-only reply"));
     }
-    cleaned
+    Ok(cleaned)
 }
 
 #[cfg(test)]
@@ -497,40 +496,47 @@ mod tests {
 
     #[test]
     fn rejects_length_answers_and_preserves_task_before_trailing_count() {
-        for raw in [
-            "25",
-            "23 characters",
-            "Length: 25",
-            "Character count: 25",
-            "Investigate Pi resets and fix Codex warnings",
-            "25 chars.",
-            "---",
+        for (raw, reason) in [
+            ("25", "invalid label: no alphabetic characters"),
+            ("23 characters", "invalid label: count-only reply"),
+            ("Length: 25", "invalid label: count-only reply"),
+            ("Character count: 25", "invalid label: count-only reply"),
+            (
+                "Investigate Pi resets and fix Codex warnings",
+                "invalid label: over length limit",
+            ),
+            ("25 chars.", "invalid label: count-only reply"),
+            ("---", "empty completion"),
         ] {
-            assert!(postprocess(raw, 25).is_empty(), "{raw}");
+            assert_eq!(
+                postprocess(raw, 25).unwrap_err().to_string(),
+                reason,
+                "{raw}"
+            );
         }
-        assert_eq!(postprocess("fix pi resets\n25", 25), "fix pi resets");
-        assert_eq!(postprocess("review PR 25", 25), "review PR 25");
+        assert_eq!(
+            postprocess("fix pi resets\n25", 25).unwrap(),
+            "fix pi resets"
+        );
+        assert_eq!(postprocess("review PR 25", 25).unwrap(), "review PR 25");
     }
 
     #[test]
     fn postprocess_cases() {
-        assert_eq!(postprocess("\"review PR 1283\"\n", 24), "review PR 1283");
         assert_eq!(
-            postprocess("`feat/moving-button`.", 24),
+            postprocess("\"review PR 1283\"\n", 24).unwrap(),
+            "review PR 1283"
+        );
+        assert_eq!(
+            postprocess("`feat/moving-button`.", 24).unwrap(),
             "feat/moving-button"
         );
-        assert_eq!(postprocess("Label: fix auth tests", 25), "fix auth tests");
         assert_eq!(
-            postprocess("Reviewing PR 1283 for the auth refactor", 24),
-            ""
+            postprocess("Label: fix auth tests", 25).unwrap(),
+            "fix auth tests"
         );
-        assert_eq!(postprocess("", 24), "");
-        assert!(
-            postprocess("abcdefghijklmnopqrstuvwxyz0123", 24)
-                .chars()
-                .count()
-                <= 24
-        );
+        assert!(postprocess("Reviewing PR 1283 for the auth refactor", 24).is_err());
+        assert!(matches!(postprocess("", 24), Err(Error::Empty)));
     }
 
     #[test]

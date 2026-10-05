@@ -333,8 +333,7 @@ impl Daemon {
             };
             match shown.filter(|s| {
                 !s.trim().is_empty()
-                    && (source == Source::SkippedManual
-                        || !llm::postprocess(s, usize::MAX).is_empty())
+                    && (source == Source::SkippedManual || llm::postprocess(s, usize::MAX).is_ok())
             }) {
                 Some(label) => {
                     let project = heuristics::project(&cwd);
@@ -562,6 +561,10 @@ impl Daemon {
                                 (
                                     self.labels
                                         .get(&id)
+                                        .filter(|p| {
+                                            agent_kind.is_none()
+                                                || p.task_session.as_deref() == Some(session_value)
+                                        })
                                         .map(|p| p.label.clone())
                                         .filter(|s| !s.is_empty())
                                         .unwrap_or(fallback),
@@ -571,12 +574,15 @@ impl Daemon {
                             }
                         }
                     } else {
-                        log_debug!("{id}: llm rate-limited; keeping previous label");
-                        // Keep the previous label (or the fallback when there is none) and don't
-                        // record the fingerprint so the next pass retries.
+                        log_debug!("{id}: llm rate-limited");
+                        // Leave the fingerprint unrecorded so the next pass retries.
                         match self
                             .labels
                             .get(&id)
+                            .filter(|p| {
+                                agent_kind.is_none()
+                                    || p.task_session.as_deref() == Some(session_value)
+                            })
                             .map(|l| l.label.clone())
                             .filter(|s| !s.is_empty())
                         {
